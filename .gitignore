@@ -1,5 +1,7 @@
 .clangd
-.vscode
+.vscode/*
 
-hw1.dSYM
+hw1.dSYM/*
+
+__pycache__/*
 
