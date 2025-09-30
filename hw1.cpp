@@ -125,127 +125,8 @@ std::unordered_set<Point, PointHasher> deadlock_points;
 const std::vector<Point> DIRS = {{-1, 0}, {0, -1}, {1, 0}, {0, 1}};
 const std::string MOVE_CHARS = "WASD"; // 注意順序對應 DIRS
 
-// 匈牙利演算法實作 - 用於最小權重二分匹配
-class HungarianAlgorithm {
-private:
-  std::vector<std::vector<int>> cost_matrix;
-  std::vector<int> u, v, p, way;
-  int n;
 
-public:
-  // 建構函式，接受成本矩陣
-  HungarianAlgorithm(const std::vector<std::vector<int>> &costs)
-      : cost_matrix(costs) {
-    n = costs.size();
-    u.assign(n + 1, 0);
-    v.assign(n + 1, 0);
-    p.assign(n + 1, 0);
-    way.assign(n + 1, 0);
-  }
-
-  // 執行匈牙利演算法，返回最小總成本
-  int solve() {
-    for (int i = 1; i <= n; ++i) {
-      p[0] = i;
-      int j0 = 0;
-      std::vector<int> minv(n + 1, INT_MAX);
-      std::vector<bool> used(n + 1, false);
-
-      do {
-        used[j0] = true;
-        int i0 = p[j0], delta = INT_MAX, j1;
-
-        for (int j = 1; j <= n; ++j) {
-          if (!used[j]) {
-            int cur = cost_matrix[i0 - 1][j - 1] - u[i0] - v[j];
-            if (cur < minv[j]) {
-              minv[j] = cur;
-              way[j] = j0;
-            }
-            if (minv[j] < delta) {
-              delta = minv[j];
-              j1 = j;
-            }
-          }
-        }
-
-        for (int j = 0; j <= n; ++j) {
-          if (used[j]) {
-            u[p[j]] += delta;
-            v[j] -= delta;
-          } else {
-            minv[j] -= delta;
-          }
-        }
-
-        j0 = j1;
-      } while (p[j0] != 0);
-
-      do {
-        int j1 = way[j0];
-        p[j0] = p[j1];
-        j0 = j1;
-      } while (j0);
-    }
-
-    int result = 0;
-    for (int j = 1; j <= n; ++j) {
-      if (p[j] != 0) {
-        result += cost_matrix[p[j] - 1][j - 1];
-      }
-    }
-    return result;
-  }
-};
-
-// 計算狀態 s 的 h_cost - 使用最小權重二分匹配
 int calculate_h_cost(const State &s) {
-  int num_boxes = s.boxPositions.size();
-  int num_goals = goals.size();
-
-  // 如果箱子數量和目標數量不同，使用舊方法作為備案
-  if (num_boxes != num_goals) {
-    int total_distance = 0;
-    for (const auto &box : s.boxPositions) {
-      int min_dist_for_this_box = 1e9;
-      for (const auto &goal : goals) {
-        int dist = distances[{goal, box}];
-        if (dist < min_dist_for_this_box) {
-          min_dist_for_this_box = dist;
-        }
-      }
-      total_distance += min_dist_for_this_box;
-    }
-    return total_distance;
-  }
-
-  // 建立成本矩陣：cost_matrix[i][j] = 將第i個箱子推到第j個目標的成本
-  std::vector<std::vector<int>> cost_matrix(num_boxes,
-                                            std::vector<int>(num_goals));
-
-  // 將 goals (set) 轉換為 vector 以便索引
-  std::vector<Point> goal_list(goals.begin(), goals.end());
-
-  for (int i = 0; i < num_boxes; ++i) {
-    for (int j = 0; j < num_goals; ++j) {
-      auto it = distances.find({goal_list[j], s.boxPositions[i]});
-      if (it != distances.end()) {
-        cost_matrix[i][j] = it->second;
-      } else {
-        // 如果找不到預計算的距離，使用曼哈頓距離作為備案
-        cost_matrix[i][j] = abs(s.boxPositions[i].r - goal_list[j].r) +
-                            abs(s.boxPositions[i].c - goal_list[j].c);
-      }
-    }
-  }
-
-  // 使用匈牙利演算法求解最小權重匹配
-  HungarianAlgorithm hungarian(cost_matrix);
-  return hungarian.solve();
-}
-
-// 舊版本的 h_cost 計算（用於比較）
-int calculate_h_cost_old(const State &s) {
   int total_distance = 0;
   for (const auto &box : s.boxPositions) {
     int min_dist_for_this_box = 1e9;
@@ -539,6 +420,47 @@ std::string find_player_path(const Point &start, const Point &end,
     }
   }
   return "none"; // 找不到路徑
+}
+
+std::string normalize_player_position(State &state) {
+  // 使用 BFS 找到玩家能到達的所有位置
+  std::queue<Point> q;
+  std::set<Point> visited;
+  Point start = state.playerPos;
+
+  q.push(start);
+  visited.insert(start);
+
+  Point topLeft = start; // 初始化為起始位置
+
+  while (!q.empty()) {
+    Point curr = q.front();
+    q.pop();
+
+    // 檢查是否是更 top-left 的位置
+    if (curr.r < topLeft.r || (curr.r == topLeft.r && curr.c < topLeft.c)) {
+      topLeft = curr;
+    }
+
+    // 探索四個方向
+    for (int i = 0; i < 4; ++i) {
+      Point next = curr + DIRS[i];
+      if (is_walkable(next, state.boxPositions) &&
+          visited.find(next) == visited.end()) {
+        visited.insert(next);
+        q.push(next);
+      }
+    }
+  }
+  state.playerPos = topLeft;
+
+  // 如果最 top-left 的位置就是當前位置，回傳空字串
+  if (topLeft == start) {
+    return "";
+  }
+
+  // 使用現有的 find_player_path 函式找到路徑
+  return find_player_path(start, topLeft, state.boxPositions);
 }
 
 void init_distances() {
@@ -967,8 +889,10 @@ int main(int argc, char *argv[]) {
 #endif
 
             // 2. 創建新狀態的資訊
+            std::string normalized_move = normalize_player_position(next_state);
             StateInfo new_info = {new_g, current_state,
-                                  player_moves + push_char, new_frozen_boxes};
+                                  player_moves + push_char + normalized_move,
+                                  new_frozen_boxes};
 
 #ifdef DEBUG
             {
