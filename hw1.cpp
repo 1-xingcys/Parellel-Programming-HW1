@@ -12,8 +12,9 @@
 #include <omp.h>
 #include <optional>
 #include <queue>
-#include <unordered_set>
 #include <string>
+#include <sys/resource.h>
+#include <unordered_set>
 #include <utility>
 
 // #define DEBUG 1
@@ -41,6 +42,7 @@ struct UnsignedCharPairHasher {
 struct State {
   unsigned char playerPos;
   std::bitset<MAX_MAP_SIZE> boxPositions; // 保持排序以作為唯一標識
+  bool forward_check;
 
   // 為了能放入 std::set 和 std::map
   bool operator<(const State &other) const {
@@ -54,10 +56,14 @@ struct State {
         return !boxPositions[i] && other.boxPositions[i];
       }
     }
+    if (forward_check != other.forward_check) {
+      return forward_check && !other.forward_check;
+    }
     return false; // 完全相等
   }
   bool operator==(const State &other) const {
-    return playerPos == other.playerPos && boxPositions == other.boxPositions;
+    return playerPos == other.playerPos && boxPositions == other.boxPositions &&
+           forward_check == other.forward_check;
   }
 };
 
@@ -71,6 +77,7 @@ struct StateHasher {
     }
     boost::hash_combine(seed, s.playerPos);
     boost::hash_combine(seed, boxPositions);
+    boost::hash_combine(seed, s.forward_check);
     return seed;
   }
 };
@@ -96,7 +103,6 @@ struct StateInfo {
 };
 
 // --- 全域變數和輔助函數 ---
-// std::vector<std::string> static_map;
 std::string static_map;
 std::bitset<MAX_MAP_SIZE> goals_bitset;
 std::unordered_set<unsigned char> goals_set;
@@ -106,17 +112,24 @@ std::unordered_map<std::pair<unsigned char, unsigned char>, int,
 tbb::concurrent_unordered_map<State, StateInfo, StateHasher> state_info_map;
 std::bitset<MAX_MAP_SIZE> deadlock_points;
 
+std::string static_map_backward;
+std::bitset<MAX_MAP_SIZE> goals_bitset_backward;
+std::unordered_set<unsigned char> goals_set_backward;
+
 // 方向向量 (Up, Left, Down, Right)
 unsigned char width, height, map_size;
-const std::string MOVE_CHARS = "WASD"; // 注意順序對應 DIRS
+const std::string MOVE_CHARS = "WASD";          // 注意順序對應 DIRS
+const std::string MOVE_CHARS_BACKWARD = "SDWA"; // 注意順序對應 DIRS
 
-int calculate_h_cost(const State &s) {
+int calculate_h_cost(const State &s, bool forward) {
+  std::unordered_set<unsigned char> &goals =
+      forward ? goals_set : goals_set_backward;
   int total_distance = 0;
   for (unsigned char box = 0; box < map_size; ++box) {
     if (!s.boxPositions.test(box))
       continue;
     int min_dist_for_this_box = 1e9;
-    for (unsigned char goal : goals_set) {
+    for (unsigned char goal : goals) {
       int dist = distances[{goal, box}];
       if (dist < min_dist_for_this_box) {
         min_dist_for_this_box = dist;
@@ -358,7 +371,23 @@ bool is_deadlock(const State &newState, const unsigned char movedBox,
 
 // 內層 BFS: 尋找玩家從 start 到 end 的路徑
 std::string find_player_path(const unsigned char start, const unsigned char end,
-                             const std::bitset<MAX_MAP_SIZE> &boxes) {
+                             const std::bitset<MAX_MAP_SIZE> &boxes,
+                             bool forward) {
+#ifdef DEBUG
+  {
+    std::cout << "[find_player_path] start: (" << start / width << ", "
+              << start % width << ")" << std::endl;
+    std::cout << "[find_player_path] end: (" << end / width << ", "
+              << end % width << ")" << std::endl;
+    std::cout << "[find_player_path] boxes: ";
+    for (unsigned char pos = 0; pos < map_size; ++pos) {
+      if (boxes.test(pos)) {
+        std::cout << "(" << pos / width << ", " << pos % width << ") ";
+      }
+    }
+    std::cout << std::endl;
+  }
+#endif
   std::queue<unsigned char> q;
   q.push(start);
   std::map<unsigned char, std::pair<unsigned char, char>> parent_map;
@@ -386,14 +415,15 @@ std::string find_player_path(const unsigned char start, const unsigned char end,
       if (is_walkable(next, boxes) && !visited.test(next)) {
         visited.set(next);
         q.push(next);
-        parent_map[next] = {curr, MOVE_CHARS[i]};
+        parent_map[next] = {curr,
+                            forward ? MOVE_CHARS[i] : MOVE_CHARS_BACKWARD[i]};
       }
     }
   }
   return "none"; // 找不到路徑
 }
 
-std::string normalize_player_position(State &state) {
+std::string normalize_player_position(State &state, bool forward) {
   // 使用 BFS 找到玩家能到達的所有位置
   std::queue<unsigned char> q;
   std::bitset<MAX_MAP_SIZE> visited;
@@ -430,11 +460,15 @@ std::string normalize_player_position(State &state) {
   }
 
   // 使用現有的 find_player_path 函式找到路徑
-  return find_player_path(start, topLeft, state.boxPositions);
+  return find_player_path(start, topLeft, state.boxPositions, forward);
 }
 
 void init_distances() {
-  for (unsigned char goal : goals_set) {
+  std::bitset<MAX_MAP_SIZE> bidirectional_goals =
+      goals_bitset | goals_bitset_backward;
+  for (unsigned char goal = 0; goal < map_size; ++goal) {
+    if (!bidirectional_goals.test(goal))
+      continue;
     std::queue<unsigned char> q;
     q.push(goal);
     std::bitset<MAX_MAP_SIZE> visited;
@@ -497,6 +531,42 @@ void init_deadlock_points() {
   }
   return;
 }
+
+void init_backword_initial_state(const State &state,
+                                 tbb::concurrent_priority_queue<Node> &pq) {
+  std::bitset<MAX_MAP_SIZE> visited;
+  for (unsigned char pos = 0; pos < map_size; ++pos) {
+    if (static_map_backward[pos] != '#' && !state.boxPositions.test(pos) &&
+        !visited.test(pos)) {
+      visited.set(pos);
+      std::queue<unsigned char> q;
+      q.push(pos);
+
+      // create new state
+      State new_state = state;
+      new_state.playerPos = pos;
+      int h = calculate_h_cost(new_state, false);
+      pq.push({new_state, h});
+      state_info_map.insert(
+          {new_state, {0, new_state, "", std::bitset<MAX_MAP_SIZE>(0)}});
+
+      // bfs to eliminate all reachable positions
+      while (!q.empty()) {
+        unsigned char curr = q.front();
+        q.pop();
+        for (int i = 0; i < 4; ++i) {
+          unsigned char next = DIRS(curr, i);
+          if (static_map_backward[next] != '#' &&
+              !state.boxPositions.test(next) && !visited.test(next)) {
+            visited.set(next);
+            q.push(next);
+          }
+        }
+      }
+    }
+  }
+}
+
 // --- 主函式 ---
 int main(int argc, char *argv[]) {
   if (argc < 2) {
@@ -511,36 +581,51 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  State initial_state;
+  State initial_forward_state, initial_backward_state;
+  initial_forward_state.forward_check = true,
+  initial_backward_state.forward_check = false;
   std::string line;
   unsigned char r = 0;
   while (std::getline(file, line)) {
     width = line.length();
     static_map += line;
+    static_map_backward += line;
     for (unsigned char c = 0; c < static_cast<int>(line.length()); ++c) {
       char tile = line[c];
       if (tile == 'o' || tile == 'O' || tile == '!') {
-        initial_state.playerPos = r * width + c;
+        initial_forward_state.playerPos = r * width + c;
       }
       if (tile == 'x' || tile == 'X') {
-        initial_state.boxPositions.set(r * width + c);
+        initial_forward_state.boxPositions.set(r * width + c);
+        goals_bitset_backward.set(r * width + c);
+        goals_set_backward.insert(r * width + c);
       }
       if (tile == '.' || tile == 'O' || tile == 'X') {
         goals_bitset.set(r * width + c);
         goals_set.insert(r * width + c);
+        initial_backward_state.boxPositions.set(r * width + c);
       }
       // 將地圖簡化為靜態部分
-      if (tile == 'o' || tile == 'x' || tile == ' ')
+      if (tile == 'o' || tile == 'x')
         static_map[r * width + c] = ' ';
-      else if (tile == 'O' || tile == 'X' || tile == '.')
+      else if (tile == 'O' || tile == 'X')
         static_map[r * width + c] = '.';
       else if (tile == '!')
         static_map[r * width + c] = '@';
+
+      if (tile == 'o' || tile == '.' || tile == 'O')
+        static_map_backward[r * width + c] = ' ';
+      else if (tile == 'x' || tile == 'X')
+        static_map_backward[r * width + c] = '.';
+      else if (tile == '!')
+        static_map_backward[r * width + c] = '@';
     }
     r++;
   }
   height = r;
   map_size = width * height;
+  unsigned char backword_end_player_pos = initial_forward_state.playerPos;
+
 #ifdef DEBUG
   std::cout << "width: " << static_cast<int>(width)
             << ", height: " << static_cast<int>(height)
@@ -555,12 +640,13 @@ int main(int argc, char *argv[]) {
 #ifdef DEBUG
   // 輸出初始狀態資訊
   std::cout << "初始狀態資訊:" << std::endl;
-  std::cout << "玩家位置: (" << initial_state.playerPos % width << ", "
-            << initial_state.playerPos / width << ")" << std::endl;
-  std::cout << "箱子數量: " << initial_state.boxPositions.size() << std::endl;
+  std::cout << "玩家位置: (" << initial_forward_state.playerPos % width << ", "
+            << initial_forward_state.playerPos / width << ")" << std::endl;
+  std::cout << "箱子數量: " << initial_forward_state.boxPositions.size()
+            << std::endl;
   std::cout << "箱子位置: ";
   for (unsigned char box = 0; box < map_size; ++box) {
-    if (initial_state.boxPositions.test(box)) {
+    if (initial_forward_state.boxPositions.test(box)) {
       std::cout << "(" << box % width << ", " << box / width << ") ";
     }
   }
@@ -594,6 +680,13 @@ int main(int argc, char *argv[]) {
       std::cout << "(" << point % width << ", " << point / width << ") ";
     }
   }
+  std::cout << "static_map_backward:" << std::endl;
+  for (unsigned char pos = 0; pos < map_size; ++pos) {
+    std::cout << static_map_backward[pos];
+    if (pos % width == width - 1) {
+      std::cout << std::endl;
+    }
+  }
   std::cout << std::endl;
 #endif
 
@@ -601,13 +694,14 @@ int main(int argc, char *argv[]) {
 
   // BFS 算法所需變數
   int initial_g = 0;
-  int initial_h = calculate_h_cost(initial_state);
+  int initial_h = calculate_h_cost(initial_forward_state, true);
   tbb::concurrent_priority_queue<Node> pq;
-  pq.push({initial_state, initial_g + initial_h});
-  std::bitset<MAX_MAP_SIZE> initial_frozen_boxes(0);
-  initial_frozen_boxes.reset();
+  // pq.push({initial_forward_state, initial_g + initial_h});
   state_info_map.insert(
-      {initial_state, {initial_g, initial_state, "", initial_frozen_boxes}});
+      {initial_forward_state,
+       {initial_g, initial_forward_state, "", std::bitset<MAX_MAP_SIZE>(0)}});
+
+  init_backword_initial_state(initial_backward_state, pq);
 
   // 平行處理所需變數
   std::atomic<bool> solution_found = false;
@@ -620,7 +714,6 @@ int main(int argc, char *argv[]) {
   std::mutex cv_mutex;
 
 #ifdef DEBUG
-  std::cout << "開始並行 BFS 搜尋..." << std::endl;
   std::atomic<int> step_count = 0;
   std::mutex debug_mutex; // 用於同步 debug 輸出
 #endif
@@ -665,192 +758,339 @@ int main(int argc, char *argv[]) {
 
 #ifdef DEBUG
       int current_step = step_count.fetch_add(1) + 1;
-      {
-        std::lock_guard<std::mutex> lock(debug_mutex);
-        std::cout << "[Thread " << thread_id << "] 步驟 " << current_step
-                  << ": 檢查狀態 - 玩家位置: ("
-                  << current_state.playerPos / width << ", "
-                  << current_state.playerPos % width << ")" << std::endl;
-        std::cout << "[Thread " << thread_id << "] 箱子位置: ";
-        for (unsigned char box = 0; box < map_size; ++box) {
-          if (current_state.boxPositions.test(box)) {
-            std::cout << "(" << box / width << ", " << box % width << ") ";
-          }
-        }
-        std::cout << std::endl;
-      }
 #endif
 
-      // 檢查是否達成目標
-      bool solved = true;
-      if ((goals_bitset & ~current_state.boxPositions).any()) {
-        solved = false;
-      }
-
-      // 找到解答，atomic 設置解答狀態
-      if (solved) {
+      if (current_state.forward_check) {
 
 #ifdef DEBUG
         {
           std::lock_guard<std::mutex> lock(debug_mutex);
-          std::cout << "[Thread " << thread_id
-                    << "] 找到解答！將解答狀態設置為 true..." << std::endl;
-        }
-#endif
-        std::lock_guard<std::mutex> lock(solution_mutex);
-        if (!solution_found) {
-          solution_found = true;
-          solution_state = current_state;
-#ifdef DEBUG
-          {
-            std::lock_guard<std::mutex> debug_lock(debug_mutex);
-            std::cout << "[Thread " << thread_id << "] 成功設置解答狀態！"
-                      << std::endl;
+          std::cout << "[Thread " << thread_id << "] 步驟 " << current_step
+                    << ": 檢查狀態 - 玩家位置: ("
+                    << current_state.playerPos / width << ", "
+                    << current_state.playerPos % width << ")" << std::endl;
+          std::cout << "[Thread " << thread_id << "] 箱子位置: ";
+          for (unsigned char box = 0; box < map_size; ++box) {
+            if (current_state.boxPositions.test(box)) {
+              std::cout << "(" << box / width << ", " << box % width << ") ";
+            }
           }
-#endif
-        }
-        break;
-      }
-
-#ifdef DEBUG
-      {
-        std::lock_guard<std::mutex> lock(debug_mutex);
-        std::cout << "[Thread " << thread_id << "] 嘗試推動箱子..."
-                  << std::endl;
-      }
-#endif
-
-      // 產生所有可能的後繼狀態 (嘗試推動每一個箱子)
-      for (unsigned char i = 0; i < map_size; ++i) {
-        if (solution_found)
-          break;
-        if (!current_state.boxPositions.test(i))
-          continue;
-        unsigned char box = i;
-
-#ifdef DEBUG
-        {
-          std::lock_guard<std::mutex> lock(debug_mutex);
-          std::cout << "[Thread " << thread_id << "] 檢查箱子 "
-                    << static_cast<int>(i) << " 在位置 (" << box / width << ", "
-                    << box % width << ")" << std::endl;
+          std::cout << std::endl;
         }
 #endif
 
-        // 嘗試四個方向
-        for (int j = 0; j < 4; ++j) {
-          if (solution_found)
-            break;
-          unsigned char box_dest = DIRS(box, j);
-          char push_char = MOVE_CHARS[j];
+        // 檢查是否達成目標
+        bool solved = true;
+        if ((goals_bitset & ~current_state.boxPositions).any()) {
+          solved = false;
+        }
 
-          unsigned char player_start_pos =
-              DIRS(box, (j + 2) % 4); // 玩家要站的位置 (箱子反方向)
-
-#ifdef DEBUG
-          {
-            std::lock_guard<std::mutex> lock(debug_mutex);
-            std::cout << "[Thread " << thread_id << "] 嘗試方向 " << push_char
-                      << " - 箱子目標: (" << box_dest / width << ", "
-                      << box_dest % width << "), 玩家需站在: ("
-                      << player_start_pos / width << ", "
-                      << player_start_pos % width << ")" << std::endl;
-          }
-#endif
-          char dest_tile = static_map[box_dest];
-          if (dest_tile == '#' || dest_tile == '@') {
-
-#ifdef DEBUG
-            {
-              std::lock_guard<std::mutex> lock(debug_mutex);
-              std::cout << "[Thread " << thread_id
-                        << "] 箱子目標位置是牆壁或脆弱地板，跳過" << std::endl;
-            }
-#endif
-
-            continue; // 箱子不能上牆或脆弱地板
-          }
-
-          if (deadlock_points.test(box_dest)) {
-#ifdef DEBUG
-            {
-              std::lock_guard<std::mutex> lock(debug_mutex);
-              std::cout << "[Thread " << thread_id
-                        << "] 箱子目標位置是死胡同，跳過" << std::endl;
-            }
-#endif
-            continue;
-          }
-
-          if (current_state.boxPositions.test(box_dest)) {
-#ifdef DEBUG
-            {
-              std::lock_guard<std::mutex> lock(debug_mutex);
-              std::cout << "[Thread " << thread_id
-                        << "] 箱子目標位置被其他箱子佔據，跳過" << std::endl;
-            }
-#endif
-            continue;
-          }
-
-          // 內層 BFS: 檢查玩家是否能走到推箱子的位置
+        // 找到解答，atomic 設置解答狀態
+        if (solved) {
 
 #ifdef DEBUG
           {
             std::lock_guard<std::mutex> lock(debug_mutex);
             std::cout << "[Thread " << thread_id
-                      << "] 檢查玩家是否能到達推箱位置..." << std::endl;
+                      << "] 找到解答！將解答狀態設置為 true..." << std::endl;
+          }
+#endif
+          std::lock_guard<std::mutex> lock(solution_mutex);
+          if (!solution_found) {
+            solution_found = true;
+            solution_state = current_state;
+#ifdef DEBUG
+            {
+              std::lock_guard<std::mutex> debug_lock(debug_mutex);
+              std::cout << "[Thread " << thread_id << "] 成功設置解答狀態！"
+                        << std::endl;
+            }
+#endif
+          }
+          break;
+        }
+
+#ifdef DEBUG
+        {
+          std::lock_guard<std::mutex> lock(debug_mutex);
+          std::cout << "[Thread " << thread_id << "] 嘗試推動箱子..."
+                    << std::endl;
+        }
+#endif
+
+        // 產生所有可能的後繼狀態 (嘗試推動每一個箱子)
+        for (unsigned char i = 0; i < map_size; ++i) {
+          if (solution_found)
+            break;
+          if (!current_state.boxPositions.test(i))
+            continue;
+          unsigned char box = i;
+
+#ifdef DEBUG
+          {
+            std::lock_guard<std::mutex> lock(debug_mutex);
+            std::cout << "[Thread " << thread_id << "] 檢查箱子 "
+                      << static_cast<int>(i) << " 在位置 (" << box / width
+                      << ", " << box % width << ")" << std::endl;
           }
 #endif
 
-          std::string player_moves =
-              find_player_path(current_state.playerPos, player_start_pos,
-                               current_state.boxPositions);
-          if (player_moves != "none") {
+          // 嘗試四個方向
+          for (int j = 0; j < 4; ++j) {
+            if (solution_found)
+              break;
+            unsigned char box_dest = DIRS(box, j);
+            char push_char = MOVE_CHARS[j];
+
+            unsigned char player_start_pos =
+                DIRS(box, (j + 2) % 4); // 玩家要站的位置 (箱子反方向)
 
 #ifdef DEBUG
             {
               std::lock_guard<std::mutex> lock(debug_mutex);
-              std::cout << "[Thread " << thread_id
-                        << "] 玩家可以到達！移動序列: "
-                        << (player_moves != "" ? player_moves : "直接推箱")
-                        << std::endl;
+              std::cout << "[Thread " << thread_id << "] 嘗試方向 " << push_char
+                        << " - 箱子目標: (" << box_dest / width << ", "
+                        << box_dest % width << "), 玩家需站在: ("
+                        << player_start_pos / width << ", "
+                        << player_start_pos % width << ")" << std::endl;
             }
 #endif
+            char dest_tile = static_map[box_dest];
+            if (dest_tile == '#' || dest_tile == '@') {
 
-            // 產生新狀態
-            State next_state;
-            next_state.playerPos = box; // 推完後玩家在箱子原來的位置
-            next_state.boxPositions = current_state.boxPositions;
-            next_state.boxPositions.reset(box);
-            next_state.boxPositions.set(box_dest);
-            // 1. 安全地讀取 current_state 的 g_cost
-            auto it_current = state_info_map.find(current_state);
-            std::bitset<MAX_MAP_SIZE> new_frozen_boxes =
-                it_current->second.frozen_boxes;
-
-            if (is_deadlock(next_state, box_dest, new_frozen_boxes)) {
 #ifdef DEBUG
               {
                 std::lock_guard<std::mutex> lock(debug_mutex);
                 std::cout << "[Thread " << thread_id
-                          << "] 新狀態是 freeze deadlock，跳過" << std::endl;
+                          << "] 箱子目標位置是牆壁或脆弱地板，跳過"
+                          << std::endl;
+              }
+#endif
+
+              continue; // 箱子不能上牆或脆弱地板
+            }
+
+            if (deadlock_points.test(box_dest)) {
+#ifdef DEBUG
+              {
+                std::lock_guard<std::mutex> lock(debug_mutex);
+                std::cout << "[Thread " << thread_id
+                          << "] 箱子目標位置是死胡同，跳過" << std::endl;
               }
 #endif
               continue;
             }
 
+            if (current_state.boxPositions.test(box_dest)) {
+#ifdef DEBUG
+              {
+                std::lock_guard<std::mutex> lock(debug_mutex);
+                std::cout << "[Thread " << thread_id
+                          << "] 箱子目標位置被其他箱子佔據，跳過" << std::endl;
+              }
+#endif
+              continue;
+            }
+
+            // 內層 BFS: 檢查玩家是否能走到推箱子的位置
+
 #ifdef DEBUG
             {
               std::lock_guard<std::mutex> lock(debug_mutex);
               std::cout << "[Thread " << thread_id
-                        << "] 產生新狀態 - 玩家位置: ("
-                        << next_state.playerPos / width << ", "
-                        << next_state.playerPos % width << ")" << std::endl;
-              std::cout << "[Thread " << thread_id << "] 新狀態箱子位置: ";
-              for (unsigned char new_box = 0; new_box < map_size; ++new_box) {
-                if (next_state.boxPositions.test(new_box)) {
-                  std::cout << "(" << new_box / width << ", " << new_box % width
+                        << "] 檢查玩家是否能到達推箱位置..." << std::endl;
+            }
+#endif
+
+            std::string player_moves =
+                find_player_path(current_state.playerPos, player_start_pos,
+                                 current_state.boxPositions, true);
+            if (player_moves != "none") {
+
+#ifdef DEBUG
+              {
+                std::lock_guard<std::mutex> lock(debug_mutex);
+                std::cout << "[Thread " << thread_id
+                          << "] 玩家可以到達！移動序列: "
+                          << (player_moves != "" ? player_moves : "直接推箱")
+                          << std::endl;
+              }
+#endif
+
+              // 產生新狀態
+              State next_state;
+              next_state.forward_check = true;
+              next_state.playerPos = box; // 推完後玩家在箱子原來的位置
+              next_state.boxPositions = current_state.boxPositions;
+              next_state.boxPositions.reset(box);
+              next_state.boxPositions.set(box_dest);
+              // 1. 安全地讀取 current_state 的 g_cost
+              auto it_current = state_info_map.find(current_state);
+              std::bitset<MAX_MAP_SIZE> new_frozen_boxes =
+                  it_current->second.frozen_boxes;
+
+              if (is_deadlock(next_state, box_dest, new_frozen_boxes)) {
+#ifdef DEBUG
+                {
+                  std::lock_guard<std::mutex> lock(debug_mutex);
+                  std::cout << "[Thread " << thread_id
+                            << "] 新狀態是 freeze deadlock，跳過" << std::endl;
+                }
+#endif
+                continue;
+              }
+
+#ifdef DEBUG
+              {
+                std::lock_guard<std::mutex> lock(debug_mutex);
+                std::cout << "[Thread " << thread_id
+                          << "] 產生新狀態 - 玩家位置: ("
+                          << next_state.playerPos / width << ", "
+                          << next_state.playerPos % width << ")" << std::endl;
+                std::cout << "[Thread " << thread_id << "] 新狀態箱子位置: ";
+                for (unsigned char new_box = 0; new_box < map_size; ++new_box) {
+                  if (next_state.boxPositions.test(new_box)) {
+                    std::cout << "(" << new_box / width << ", "
+                              << new_box % width << ") ";
+                  }
+                }
+                std::cout << std::endl;
+              }
+#endif
+
+              int new_g = it_current->second.g_cost + 1;
+
+#ifdef DEBUG
+              {
+                std::lock_guard<std::mutex> lock(debug_mutex);
+                std::cout << "[Thread " << thread_id
+                          << "] 計算新狀態 g_cost: " << new_g << std::endl;
+              }
+#endif
+
+              // 2. 創建新狀態的資訊
+              std::string normalized_move =
+                  normalize_player_position(next_state, true);
+              StateInfo new_info = {new_g, current_state,
+                                    player_moves + push_char + normalized_move,
+                                    new_frozen_boxes};
+
+#ifdef DEBUG
+              {
+                std::lock_guard<std::mutex> lock(debug_mutex);
+                std::cout << "[Thread " << thread_id
+                          << "] 創建新狀態資訊 - 移動序列: "
+                          << player_moves + push_char << std::endl;
+              }
+#endif
+
+              // 3. 嘗試原子性插入
+              auto result_pair = state_info_map.insert({next_state, new_info});
+              bool inserted_successfully = result_pair.second;
+
+              if (inserted_successfully) {
+                // 我們是第一個，成功佔位，直接加入工作佇列
+#ifdef DEBUG
+                {
+                  std::lock_guard<std::mutex> lock(debug_mutex);
+                  std::cout << "[Thread " << thread_id
+                            << "] 成功插入新狀態到 state_info_map" << std::endl;
+                }
+#endif
+                int new_h = calculate_h_cost(next_state, true);
+                int new_f = new_g + new_h;
+#ifdef DEBUG
+                {
+                  std::lock_guard<std::mutex> lock(debug_mutex);
+                  std::cout << "[Thread " << thread_id
+                            << "] 計算 h_cost: " << new_h
+                            << ", f_cost: " << new_f << std::endl;
+                }
+#endif
+                pq.push({next_state, new_f});
+                cv.notify_one();
+#ifdef DEBUG
+                {
+                  std::lock_guard<std::mutex> lock(debug_mutex);
+                  std::cout << "[Thread " << thread_id
+                            << "] 新狀態已加入優先佇列" << std::endl;
+                }
+#endif
+              }
+
+#ifdef DEBUG
+              {
+                std::lock_guard<std::mutex> lock(debug_mutex);
+                std::cout << "[Thread " << thread_id
+                          << "] 新狀態插入 g_cost_map: " << new_g << std::endl;
+                std::cout << result_pair.second << std::endl;
+              }
+#endif
+            }
+          }
+#ifdef DEBUG
+          {
+            std::lock_guard<std::mutex> lock(debug_mutex);
+            std::cout << "[Thread " << thread_id
+                      << "] 當前佇列大小: " << pq.size()
+                      << ", 已訪問狀態數: " << state_info_map.size()
+                      << std::endl;
+          }
+#endif
+        }
+
+      } else { // backward states search
+        for (unsigned char i = 0; i < map_size; ++i) {
+          if (solution_found)
+            break;
+          if (!current_state.boxPositions.test(i))
+            continue;
+
+          unsigned char box = i;
+#ifdef DEBUG
+          {
+            std::lock_guard<std::mutex> lock(debug_mutex);
+            std::cout << "[Thread " << thread_id << "] 處理箱子位置: ("
+                      << box / width << ", " << box % width << ")" << std::endl;
+          }
+#endif
+          for (int j = 0; j < 4; ++j) {
+            if (solution_found)
+              break;
+            unsigned char box_dest = DIRS(box, j);
+            char push_char = MOVE_CHARS_BACKWARD[j];
+            unsigned char player_start_pos = box_dest;
+            if (current_state.boxPositions.test(player_start_pos) ||
+                static_map_backward[player_start_pos] == '#' || static_map_backward[player_start_pos] == '@')
+              continue;
+
+            int try_player_end_pos = DIRS(player_start_pos, j);
+            if (try_player_end_pos == -1)
+              continue;
+            unsigned char player_end_pos = try_player_end_pos;
+            if (current_state.boxPositions.test(player_end_pos) ||
+                static_map_backward[player_end_pos] == '#')
+              continue;
+
+#ifdef DEBUG
+            {
+              std::lock_guard<std::mutex> lock(debug_mutex);
+              std::cout << "[Thread " << thread_id << "] 嘗試方向 " << j
+                        << " (推動字符: " << push_char << ")" << std::endl;
+              std::cout << "[Thread " << thread_id << "] 箱子目標位置: ("
+                        << box_dest / width << ", " << box_dest % width << ")"
+                        << std::endl;
+              std::cout << "[Thread " << thread_id << "] 玩家結束位置: ("
+                        << player_end_pos / width << ", "
+                        << player_end_pos % width << ")" << std::endl;
+              std::cout << "[Thread " << thread_id << "] 玩家目前位置: ("
+                        << current_state.playerPos / width << ", "
+                        << current_state.playerPos % width << ")" << std::endl;
+              std::cout << "[Thread " << thread_id
+                        << "] current_state 的 boxPositions: ";
+              for (unsigned char pos = 0; pos < map_size; ++pos) {
+                if (current_state.boxPositions.test(pos)) {
+                  std::cout << "(" << pos / width << ", " << pos % width
                             << ") ";
                 }
               }
@@ -858,83 +1098,107 @@ int main(int argc, char *argv[]) {
             }
 #endif
 
-            int new_g = it_current->second.g_cost + 1;
+            std::string player_moves =
+                find_player_path(current_state.playerPos, player_start_pos,
+                                 current_state.boxPositions, false);
+            if (player_moves != "none") {
+              // 產生新狀態
+              State next_state;
+              next_state.forward_check = false;
+              next_state.playerPos =
+                  player_end_pos; // 推完後玩家在箱子原來的位置
+              next_state.boxPositions = current_state.boxPositions;
+              next_state.boxPositions.reset(box);
+              next_state.boxPositions.set(box_dest);
+              // 1. 安全地讀取 current_state 的 g_cost
+              auto it_current = state_info_map.find(current_state);
+              int new_g = it_current->second.g_cost + 1;
 
-#ifdef DEBUG
-            {
-              std::lock_guard<std::mutex> lock(debug_mutex);
-              std::cout << "[Thread " << thread_id
-                        << "] 計算新狀態 g_cost: " << new_g << std::endl;
-            }
-#endif
-
-            // 2. 創建新狀態的資訊
-            std::string normalized_move = normalize_player_position(next_state);
-            StateInfo new_info = {new_g, current_state,
-                                  player_moves + push_char + normalized_move,
-                                  new_frozen_boxes};
-
-#ifdef DEBUG
-            {
-              std::lock_guard<std::mutex> lock(debug_mutex);
-              std::cout << "[Thread " << thread_id
-                        << "] 創建新狀態資訊 - 移動序列: "
-                        << player_moves + push_char << std::endl;
-            }
-#endif
-
-            // 3. 嘗試原子性插入
-            auto result_pair = state_info_map.insert({next_state, new_info});
-            bool inserted_successfully = result_pair.second;
-
-            if (inserted_successfully) {
-              // 我們是第一個，成功佔位，直接加入工作佇列
+              // 2. 創建新狀態的資訊
+              std::string normalized_move =
+                  normalize_player_position(next_state, false);
+              bool solved = false;
+              if ((goals_bitset_backward & ~next_state.boxPositions).none()) {
+                std::string player_moves_to_initial_pos = find_player_path(
+                    next_state.playerPos, backword_end_player_pos,
+                    next_state.boxPositions, false);
+                if (player_moves_to_initial_pos != "none") {
+                  normalized_move += player_moves_to_initial_pos;
+                  solved = true;
+                }
+              }
 #ifdef DEBUG
               {
                 std::lock_guard<std::mutex> lock(debug_mutex);
                 std::cout << "[Thread " << thread_id
-                          << "] 成功插入新狀態到 state_info_map" << std::endl;
+                          << "] 創建新狀態資訊 - 移動序列: " << player_moves
+                          << " + " << push_char << " + " << normalized_move
+                          << std::endl;
               }
 #endif
-              int new_h = calculate_h_cost(next_state);
-              int new_f = new_g + new_h;
+              StateInfo new_info = {new_g, current_state,
+                                    player_moves + push_char + normalized_move,
+                                    std::bitset<MAX_MAP_SIZE>(0)};
+              // 3. 嘗試原子性插入
+              auto result_pair = state_info_map.insert({next_state, new_info});
+              bool inserted_successfully = result_pair.second;
+
+              if (inserted_successfully) {
+                if (solved) {
+                  std::lock_guard<std::mutex> lock(solution_mutex);
+                  if (!solution_found) {
+                    solution_found = true;
+                    solution_state = next_state;
+#ifdef DEBUG
+                    {
+                      std::lock_guard<std::mutex> debug_lock(debug_mutex);
+                      std::cout << "[Thread " << thread_id
+                                << "] 成功設置解答狀態！" << std::endl;
+                    }
+#endif
+                  }
+                  break;
+                }
+                // 我們是第一個，成功佔位，直接加入工作佇列
+#ifdef DEBUG
+                {
+                  std::lock_guard<std::mutex> lock(debug_mutex);
+                  std::cout << "[Thread " << thread_id
+                            << "] 成功插入新狀態到 state_info_map" << std::endl;
+                }
+#endif
+                int new_h = calculate_h_cost(next_state, false);
+                int new_f = new_g + new_h;
+                pq.push({next_state, new_f});
+                cv.notify_one();
+#ifdef DEBUG
+                {
+                  std::lock_guard<std::mutex> lock(debug_mutex);
+                  std::cout << "[Thread " << thread_id
+                            << "] 新狀態已加入優先佇列" << std::endl;
+                }
+#endif
+              } else {
+#ifdef DEBUG
+                {
+                  std::lock_guard<std::mutex> lock(debug_mutex);
+                  std::cout << "[Thread " << thread_id
+                            << "] 狀態已存在於 state_info_map，跳過"
+                            << std::endl;
+                }
+#endif
+              }
+            } else {
 #ifdef DEBUG
               {
                 std::lock_guard<std::mutex> lock(debug_mutex);
                 std::cout << "[Thread " << thread_id
-                          << "] 計算 h_cost: " << new_h << ", f_cost: " << new_f
-                          << std::endl;
-              }
-#endif
-              pq.push({next_state, new_f});
-              cv.notify_one();
-#ifdef DEBUG
-              {
-                std::lock_guard<std::mutex> lock(debug_mutex);
-                std::cout << "[Thread " << thread_id << "] 新狀態已加入優先佇列"
-                          << std::endl;
+                          << "] 找不到玩家路徑，跳過此移動" << std::endl;
               }
 #endif
             }
-
-#ifdef DEBUG
-            {
-              std::lock_guard<std::mutex> lock(debug_mutex);
-              std::cout << "[Thread " << thread_id
-                        << "] 新狀態插入 g_cost_map: " << new_g << std::endl;
-              std::cout << result_pair.second << std::endl;
-            }
-#endif
           }
         }
-#ifdef DEBUG
-        {
-          std::lock_guard<std::mutex> lock(debug_mutex);
-          std::cout << "[Thread " << thread_id
-                    << "] 當前佇列大小: " << pq.size()
-                    << ", 已訪問狀態數: " << state_info_map.size() << std::endl;
-        }
-#endif
       }
     }
 
@@ -946,7 +1210,7 @@ int main(int argc, char *argv[]) {
       std::cout << "Thread " << thread_id << " 結束執行" << std::endl;
     }
 #endif
-  }
+  } // end of parallel region
 
 #ifdef DEBUG
   std::cout << "所有 threads 執行完畢，總共處理了 " << step_count.load()
@@ -956,17 +1220,30 @@ int main(int argc, char *argv[]) {
   if (solution_found && solution_state) {
     std::string solution = "";
     State at = *solution_state;
-    while (!(at.playerPos == initial_state.playerPos &&
-             at.boxPositions == initial_state.boxPositions)) {
-
-      auto it = state_info_map.find(at);
-      if (it == state_info_map.end()) {
-        std::cerr << "No solution found." << std::endl;
-        return 1;
+    if (solution_state->forward_check) {
+      while (state_info_map[at].g_cost != 0) {
+        auto it = state_info_map.find(at);
+        if (it == state_info_map.end()) {
+          std::cerr << "No solution found." << std::endl;
+          return 1;
+        }
+        const StateInfo &p = it->second;
+        solution = p.move_to_get_here + solution;
+        at = p.parent_state;
       }
-      const StateInfo &p = it->second;
-      solution = p.move_to_get_here + solution;
-      at = p.parent_state;
+    } else {
+      while (state_info_map[at].g_cost != 0) {
+        auto it = state_info_map.find(at);
+        if (it == state_info_map.end()) {
+          std::cerr << "No solution found." << std::endl;
+          return 1;
+        }
+        const StateInfo &p = it->second;
+        std::string move_to_get_here = p.move_to_get_here;
+        std::reverse(move_to_get_here.begin(), move_to_get_here.end());
+        solution += move_to_get_here;
+        at = p.parent_state;
+      }
     }
     std::cout << solution << std::endl;
   } else {
