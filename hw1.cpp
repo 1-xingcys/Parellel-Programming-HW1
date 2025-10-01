@@ -662,7 +662,6 @@ int main(int argc, char *argv[]) {
 
       // 有工作要做
       State current_state = current_node.state;
-      std::cout << std::flush;
 
 #ifdef DEBUG
       int current_step = step_count.fetch_add(1) + 1;
