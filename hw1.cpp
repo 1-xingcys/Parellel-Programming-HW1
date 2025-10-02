@@ -1,7 +1,6 @@
 #include "tbb/concurrent_priority_queue.h"
 #include "tbb/concurrent_unordered_map.h"
 #include "tbb/concurrent_unordered_set.h"
-#include <algorithm>
 #include <bitset>
 #include <boost/functional/hash.hpp>
 #include <condition_variable>
@@ -170,7 +169,6 @@ std::string find_player_path(const unsigned char start, const unsigned char end,
         path += parent_move[at];
         at = parent_pos[at];
       }
-      std::reverse(path.begin(), path.end());
       return path;
     }
 
@@ -492,7 +490,7 @@ int main(int argc, char *argv[]) {
                     next_state.playerPos, backword_end_player_pos,
                     next_state.boxPositions);
                 if (player_moves_to_initial_pos != "none") {
-                  normalized_move += player_moves_to_initial_pos;
+                  normalized_move = player_moves_to_initial_pos + normalized_move;
                   solved = true;
                 }
               }
@@ -506,7 +504,7 @@ int main(int argc, char *argv[]) {
               }
 #endif
               StateInfo new_info = {new_g, current_state,
-                                    player_moves + push_char + normalized_move};
+                                    normalized_move + push_char + player_moves};
               // 3. 嘗試原子性插入
               auto result_pair = state_info_map.insert({next_state, new_info});
               bool inserted_successfully = result_pair.second;
@@ -594,9 +592,7 @@ int main(int argc, char *argv[]) {
           return 1;
         }
         const StateInfo &p = it->second;
-        std::string move_to_get_here = p.move_to_get_here;
-        std::reverse(move_to_get_here.begin(), move_to_get_here.end());
-        solution += move_to_get_here;
+        solution += p.move_to_get_here;
         at = p.parent_state;
     }
     std::cout << solution << std::endl;
