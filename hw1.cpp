@@ -15,7 +15,6 @@
 #include <unordered_set>
 #include <utility>
 
-// #define DEBUG 1
 #define AXIS_VERTICAL 0
 #define AXIS_HORIZONTAL 1
 #define MAX_MAP_SIZE 256
@@ -25,16 +24,6 @@
    : (dir_code) == 2 ? ((pos) >= width * (height - 1) ? -1 : (pos) + width)    \
    : (dir_code) == 3 ? ((pos) % width == width - 1 ? -1 : (pos) + 1)           \
                      : -1)
-
-struct UnsignedCharPairHasher {
-  std::size_t
-  operator()(const std::pair<unsigned char, unsigned char> &pp) const {
-    std::size_t seed = 0;
-    boost::hash_combine(seed, pp.first);
-    boost::hash_combine(seed, pp.second);
-    return seed;
-  }
-};
 
 // game state
 struct State {
@@ -88,7 +77,9 @@ struct StateInfo {
   std::string move_to_get_here;
 };
 
-// global variables and helper functions
+/**
+ * global variables and helper functions
+ */
 tbb::concurrent_unordered_map<State, StateInfo, StateHasher> state_info_map;
 
 std::string static_map_backward;
@@ -127,21 +118,6 @@ bool is_walkable(const unsigned char p,
 // find the path from start to end for the player
 std::string find_player_path(const unsigned char start, const unsigned char end,
                              const std::bitset<MAX_MAP_SIZE> &boxes) {
-#ifdef DEBUG
-  {
-    std::cout << "[find_player_path] start: (" << start / width << ", "
-              << start % width << ")" << std::endl;
-    std::cout << "[find_player_path] end: (" << end / width << ", "
-              << end % width << ")" << std::endl;
-    std::cout << "[find_player_path] boxes: ";
-    for (unsigned char pos = 0; pos < map_size; ++pos) {
-      if (boxes.test(pos)) {
-        std::cout << "(" << pos / width << ", " << pos % width << ") ";
-      }
-    }
-    std::cout << std::endl;
-  }
-#endif
   std::queue<unsigned char> q;
   q.push(start);
   unsigned char parent_pos[MAX_MAP_SIZE];
@@ -323,11 +299,6 @@ int main(int argc, char *argv[]) {
   height = r;
   map_size = width * height;
 
-#ifdef DEBUG
-  std::cout << "width: " << static_cast<int>(width)
-            << ", height: " << static_cast<int>(height)
-            << ", map_size: " << static_cast<int>(map_size) << std::endl;
-#endif
   file.close();
 
   init_distances();
@@ -349,23 +320,8 @@ int main(int argc, char *argv[]) {
   std::condition_variable cv;
   std::mutex cv_mutex;
 
-#ifdef DEBUG
-  std::atomic<int> step_count = 0;
-  std::mutex debug_mutex; // 用於同步 debug 輸出
-#endif
-
 #pragma omp parallel num_threads(6)
   {
-
-#ifdef DEBUG
-    int thread_id = omp_get_thread_num();
-    int num_threads = omp_get_num_threads();
-    {
-      std::lock_guard<std::mutex> lock(debug_mutex);
-      std::cout << "Thread " << thread_id << " 開始執行 (總共 " << num_threads
-                << " 個 threads)" << std::endl;
-    }
-#endif
 
     active_threads++;
     Node current_node;
@@ -392,10 +348,6 @@ int main(int argc, char *argv[]) {
       // there is work to do
       State current_state = current_node.state;
 
-#ifdef DEBUG
-      int current_step = step_count.fetch_add(1) + 1;
-#endif
-
        // backward states search
         for (unsigned char i = 0; i < map_size; ++i) {
           if (solution_found)
@@ -404,13 +356,7 @@ int main(int argc, char *argv[]) {
             continue;
 
           unsigned char box = i;
-#ifdef DEBUG
-          {
-            std::lock_guard<std::mutex> lock(debug_mutex);
-            std::cout << "[Thread " << thread_id << "] 處理箱子位置: ("
-                      << box / width << ", " << box % width << ")" << std::endl;
-          }
-#endif
+
           for (int j = 0; j < 4; ++j) {
             if (solution_found)
               break;
@@ -432,32 +378,6 @@ int main(int argc, char *argv[]) {
             if (current_state.boxPositions.test(player_end_pos) ||
                 static_map_backward[player_end_pos] == '#')
               continue;
-
-#ifdef DEBUG
-            {
-              std::lock_guard<std::mutex> lock(debug_mutex);
-              std::cout << "[Thread " << thread_id << "] 嘗試方向 " << j
-                        << " (推動字符: " << push_char << ")" << std::endl;
-              std::cout << "[Thread " << thread_id << "] 箱子目標位置: ("
-                        << box_dest / width << ", " << box_dest % width << ")"
-                        << std::endl;
-              std::cout << "[Thread " << thread_id << "] 玩家結束位置: ("
-                        << player_end_pos / width << ", "
-                        << player_end_pos % width << ")" << std::endl;
-              std::cout << "[Thread " << thread_id << "] 玩家目前位置: ("
-                        << current_state.playerPos / width << ", "
-                        << current_state.playerPos % width << ")" << std::endl;
-              std::cout << "[Thread " << thread_id
-                        << "] current_state 的 boxPositions: ";
-              for (unsigned char pos = 0; pos < map_size; ++pos) {
-                if (current_state.boxPositions.test(pos)) {
-                  std::cout << "(" << pos / width << ", " << pos % width
-                            << ") ";
-                }
-              }
-              std::cout << std::endl;
-            }
-#endif
 
             std::string player_moves =
                 find_player_path(current_state.playerPos, player_start_pos,
@@ -489,18 +409,9 @@ int main(int argc, char *argv[]) {
                   solved = true;
                 }
               }
-#ifdef DEBUG
-              {
-                std::lock_guard<std::mutex> lock(debug_mutex);
-                std::cout << "[Thread " << thread_id
-                          << "] 創建新狀態資訊 - 移動序列: " << player_moves
-                          << " + " << push_char << " + " << normalized_move
-                          << std::endl;
-              }
-#endif
               StateInfo new_info = {new_g, current_state,
                                     normalized_move + push_char + player_moves};
-                                    
+
               // try to insert the new state atomically
               auto result_pair = state_info_map.insert({next_state, new_info});
               bool inserted_successfully = result_pair.second;
@@ -511,72 +422,21 @@ int main(int argc, char *argv[]) {
                   if (!solution_found) {
                     solution_found = true;
                     solution_state = next_state;
-#ifdef DEBUG
-                    {
-                      std::lock_guard<std::mutex> debug_lock(debug_mutex);
-                      std::cout << "[Thread " << thread_id
-                                << "] 成功設置解答狀態！" << std::endl;
-                    }
-#endif
                   }
                   break;
                 }
-                // 我們是第一個，成功佔位，直接加入工作佇列
-#ifdef DEBUG
-                {
-                  std::lock_guard<std::mutex> lock(debug_mutex);
-                  std::cout << "[Thread " << thread_id
-                            << "] 成功插入新狀態到 state_info_map" << std::endl;
-                }
-#endif
                 int new_h = calculate_h_cost(next_state);
                 int new_f = new_g + new_h;
                 pq.push({next_state, new_f});
                 cv.notify_one();
-#ifdef DEBUG
-                {
-                  std::lock_guard<std::mutex> lock(debug_mutex);
-                  std::cout << "[Thread " << thread_id
-                            << "] 新狀態已加入優先佇列" << std::endl;
-                }
-#endif
-              } else {
-#ifdef DEBUG
-                {
-                  std::lock_guard<std::mutex> lock(debug_mutex);
-                  std::cout << "[Thread " << thread_id
-                            << "] 狀態已存在於 state_info_map，跳過"
-                            << std::endl;
-                }
-#endif
               }
-            } else {
-#ifdef DEBUG
-              {
-                std::lock_guard<std::mutex> lock(debug_mutex);
-                std::cout << "[Thread " << thread_id
-                          << "] 找不到玩家路徑，跳過此移動" << std::endl;
-              }
-#endif
             }
         }
       }
     }
 
     active_threads--;
-
-#ifdef DEBUG
-    {
-      std::lock_guard<std::mutex> lock(debug_mutex);
-      std::cout << "Thread " << thread_id << " 結束執行" << std::endl;
-    }
-#endif
   } // end of parallel region
-
-#ifdef DEBUG
-  std::cout << "所有 threads 執行完畢，總共處理了 " << step_count.load()
-            << " 個狀態" << std::endl;
-#endif
 
   if (solution_found && solution_state) {
     std::string solution = "";
