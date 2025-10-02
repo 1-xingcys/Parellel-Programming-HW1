@@ -59,7 +59,6 @@ struct State {
   }
 };
 
-// 為 State 結構提供一個雜湊函式 (Hasher)
 struct StateHasher {
   std::size_t operator()(const State &s) const {
     std::size_t seed = 0;
@@ -89,7 +88,7 @@ struct StateInfo {
   std::string move_to_get_here;
 };
 
-// --- 全域變數和輔助函數 ---
+// global variables and helper functions
 tbb::concurrent_unordered_map<State, StateInfo, StateHasher> state_info_map;
 
 std::string static_map_backward;
@@ -97,9 +96,8 @@ std::bitset<MAX_MAP_SIZE> goals_bitset_backward;
 std::unordered_set<unsigned char> goals_set_backward;
 int distances[MAX_MAP_SIZE][MAX_MAP_SIZE] = {{0}};
 
-// 方向向量 (Up, Left, Down, Right)
 unsigned char width, height, map_size;
-const std::string MOVE_CHARS_BACKWARD = "SDWA"; // 注意順序對應 DIRS
+const std::string MOVE_CHARS_BACKWARD = "SDWA";
 
 int calculate_h_cost(const State &s) {
   int total_distance = 0;
@@ -118,18 +116,15 @@ int calculate_h_cost(const State &s) {
   return total_distance;
 }
 
-// 檢查某座標是否可走 (對玩家而言)
+// check if the position is walkable for the player
 bool is_walkable(const unsigned char p,
                  const std::bitset<MAX_MAP_SIZE> &boxes) {
   char tile = static_map_backward[p];
-  if (tile == '#') {
-    return false;
-  }
-  // 檢查是否撞到箱子
+  if (tile == '#') return false;
   return !boxes.test(p);
 }
 
-// 內層 BFS: 尋找玩家從 start 到 end 的路徑
+// find the path from start to end for the player
 std::string find_player_path(const unsigned char start, const unsigned char end,
                              const std::bitset<MAX_MAP_SIZE> &boxes) {
 #ifdef DEBUG
@@ -178,11 +173,11 @@ std::string find_player_path(const unsigned char start, const unsigned char end,
       }
     }
   }
-  return "none"; // 找不到路徑
+  return "none";
 }
 
 std::string normalize_player_position(State &state) {
-  // 使用 BFS 找到玩家能到達的所有位置
+  // use BFS to find all reachable positions for the player
   std::queue<unsigned char> q;
   std::bitset<MAX_MAP_SIZE> visited;
   unsigned char start = state.playerPos;
@@ -190,18 +185,18 @@ std::string normalize_player_position(State &state) {
   q.push(start);
   visited.set(start);
 
-  unsigned char topLeft = start; // 初始化為起始位置
+  unsigned char topLeft = start; // initialize to the start position
 
   while (!q.empty()) {
     unsigned char curr = q.front();
     q.pop();
 
-    // 檢查是否是更 top-left 的位置
+    // check if it is the top-left position
     if (curr < topLeft) {
       topLeft = curr;
     }
 
-    // 探索四個方向
+    // explore four directions
     for (int i = 0; i < 4; ++i) {
       unsigned char next = DIRS(curr, i);
       if (is_walkable(next, state.boxPositions) && !visited.test(next)) {
@@ -212,12 +207,11 @@ std::string normalize_player_position(State &state) {
   }
   state.playerPos = topLeft;
 
-  // 如果最 top-left 的位置就是當前位置，回傳空字串
+  // if the top-left position is the current position, return empty string
   if (topLeft == start) {
     return "";
   }
 
-  // 使用現有的 find_player_path 函式找到路徑
   return find_player_path(start, topLeft, state.boxPositions);
 }
 
@@ -283,14 +277,14 @@ void init_backword_initial_state(const State &state,
   }
 }
 
-// --- 主函式 ---
+
 int main(int argc, char *argv[]) {
   if (argc < 2) {
     std::cerr << "Usage: " << argv[0] << " <map_file>" << std::endl;
     return 1;
   }
 
-  // 1. 讀取並解析地圖
+  // 1. read and parse the map
   std::ifstream file(argv[1]);
   if (!file) {
     std::cerr << "Error: Cannot open file " << argv[1] << std::endl;
@@ -336,22 +330,21 @@ int main(int argc, char *argv[]) {
 #endif
   file.close();
 
-  // 初始化距離
   init_distances();
 
-  // 2. BFS 初始化
+  // 2. BFS initialization
 
-  // BFS 算法所需變數
+  // BFS variables
   tbb::concurrent_priority_queue<Node> pq;
 
   init_backword_initial_state(initial_backward_state, pq);
 
-  // 平行處理所需變數
+  // parallel processing variables
   std::atomic<bool> solution_found = false;
   std::optional<State> solution_state;
   std::mutex solution_mutex;
 
-  // 紀錄正在工作的 threads 數量
+  // record the number of threads working
   std::atomic<int> active_threads = 0;
   std::condition_variable cv;
   std::mutex cv_mutex;
@@ -376,27 +369,27 @@ int main(int argc, char *argv[]) {
 
     active_threads++;
     Node current_node;
-    // 3. 外層 BFS (狀態搜尋) - 多執行緒並行處理
+    // 3. state search - parallel processing
     while (!solution_found) {
       bool got_work = pq.try_pop(current_node);
 
       if (!got_work) {
-        // 如果沒有工作，檢查是否所有 threads 都在等待
+        // if there is no work, check if all threads are waiting
         active_threads--;
         if (active_threads == 0) {
-          // 所有 threads 都沒有工作，搜尋結束
+          // if all threads are waiting, the search is over
           cv.notify_all();
           break;
         }
 
-        // 等待一小段時間，看是否有新工作
+        // wait for a short time, check if there is new work
         std::unique_lock<std::mutex> lock(cv_mutex);
         cv.wait_for(lock, std::chrono::milliseconds(1));
         active_threads++;
         continue;
       }
 
-      // 有工作要做
+      // there is work to do
       State current_state = current_node.state;
 
 #ifdef DEBUG
@@ -424,6 +417,8 @@ int main(int argc, char *argv[]) {
             unsigned char box_dest = DIRS(box, j);
             char push_char = MOVE_CHARS_BACKWARD[j];
             unsigned char player_start_pos = box_dest;
+
+            // if the player start position is a box or a wall, skip
             if (current_state.boxPositions.test(player_start_pos) ||
                 static_map_backward[player_start_pos] == '#' || static_map_backward[player_start_pos] == '@')
               continue;
@@ -432,6 +427,8 @@ int main(int argc, char *argv[]) {
             if (try_player_end_pos == -1)
               continue;
             unsigned char player_end_pos = try_player_end_pos;
+
+            // if the player end position is a box or a wall, skip
             if (current_state.boxPositions.test(player_end_pos) ||
                 static_map_backward[player_end_pos] == '#')
               continue;
@@ -465,22 +462,24 @@ int main(int argc, char *argv[]) {
             std::string player_moves =
                 find_player_path(current_state.playerPos, player_start_pos,
                                  current_state.boxPositions);
+
+            // if the player can moves to the start position, explore!
             if (player_moves != "none") {
-              // 產生新狀態
               State next_state;
-              next_state.playerPos =
-                  player_end_pos; // 推完後玩家在箱子原來的位置
+              next_state.playerPos = player_end_pos;
               next_state.boxPositions = current_state.boxPositions;
               next_state.boxPositions.reset(box);
               next_state.boxPositions.set(box_dest);
-              // 1. 安全地讀取 current_state 的 g_cost
+
               auto it_current = state_info_map.find(current_state);
               int new_g = it_current->second.g_cost + 1;
 
-              // 2. 創建新狀態的資訊
+              // normalize the player position, to reduce the search space
               std::string normalized_move =
                   normalize_player_position(next_state);
               bool solved = false;
+
+              // handle the case that all boxes are at the goals, we need to check if the player can moves to the initial position
               if ((goals_bitset_backward & ~next_state.boxPositions).none()) {
                 std::string player_moves_to_initial_pos = find_player_path(
                     next_state.playerPos, backword_end_player_pos,
@@ -501,7 +500,8 @@ int main(int argc, char *argv[]) {
 #endif
               StateInfo new_info = {new_g, current_state,
                                     normalized_move + push_char + player_moves};
-              // 3. 嘗試原子性插入
+                                    
+              // try to insert the new state atomically
               auto result_pair = state_info_map.insert({next_state, new_info});
               bool inserted_successfully = result_pair.second;
 
