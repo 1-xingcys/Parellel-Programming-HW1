@@ -36,24 +36,23 @@ struct UnsignedCharPairHasher {
   }
 };
 
-// --- 遊戲狀態結構 ---
+// game state
 struct State {
   unsigned char playerPos;
-  std::bitset<MAX_MAP_SIZE> boxPositions; // 保持排序以作為唯一標識
+  std::bitset<MAX_MAP_SIZE> boxPositions;
 
-  // 為了能放入 std::set 和 std::map
+  // for std::set and std::map
   bool operator<(const State &other) const {
     if (playerPos < other.playerPos)
       return true;
     if (other.playerPos < playerPos)
       return false;
-    // 逐位比較 bitset，避免 to_ulong() overflow
     for (int i = 0; i < MAX_MAP_SIZE; ++i) {
       if (boxPositions[i] != other.boxPositions[i]) {
         return !boxPositions[i] && other.boxPositions[i];
       }
     }
-    return false; // 完全相等
+    return false;
   }
   bool operator==(const State &other) const {
     return playerPos == other.playerPos && boxPositions == other.boxPositions;
@@ -74,16 +73,13 @@ struct StateHasher {
   }
 };
 
-// 用一個 wrapper 結構來儲存狀態和它的 f-cost
+// for priority_queue
 struct Node {
   State state;
   int f_cost;
 
-  // priority_queue 預設是 max-heap，我們需要 min-heap，所以反轉比較符
-  bool operator>(const Node &other) const { return f_cost > other.f_cost; }
-
-  // TBB concurrent_priority_queue 需要 < 運算符
-  bool operator<(const Node &other) const { return f_cost < other.f_cost; }
+  // TBB concurrent_priority_queue needs < operator
+  bool operator<(const Node &other) const { return f_cost > other.f_cost; }
 };
 
 // For outside BFS
