@@ -7,7 +7,6 @@
 #include <condition_variable>
 #include <fstream>
 #include <iostream>
-#include <map>
 #include <mutex>
 #include <omp.h>
 #include <optional>
@@ -101,9 +100,7 @@ tbb::concurrent_unordered_map<State, StateInfo, StateHasher> state_info_map;
 std::string static_map_backward;
 std::bitset<MAX_MAP_SIZE> goals_bitset_backward;
 std::unordered_set<unsigned char> goals_set_backward;
-std::unordered_map<std::pair<unsigned char, unsigned char>, int,
-                   UnsignedCharPairHasher>
-    distances;
+int distances[MAX_MAP_SIZE][MAX_MAP_SIZE] = {{0}};
 
 // 方向向量 (Up, Left, Down, Right)
 unsigned char width, height, map_size;
@@ -116,7 +113,7 @@ int calculate_h_cost(const State &s) {
       continue;
     int min_dist_for_this_box = 1e9;
     for (unsigned char goal : goals_set_backward) {
-      int dist = distances[{goal, box}];
+      int dist = distances[goal][box];
       if (dist < min_dist_for_this_box) {
         min_dist_for_this_box = dist;
       }
@@ -157,7 +154,8 @@ std::string find_player_path(const unsigned char start, const unsigned char end,
 #endif
   std::queue<unsigned char> q;
   q.push(start);
-  std::map<unsigned char, std::pair<unsigned char, char>> parent_map;
+  unsigned char parent_pos[MAX_MAP_SIZE];
+  char parent_move[MAX_MAP_SIZE];
   std::bitset<MAX_MAP_SIZE> visited;
   visited.set(start);
 
@@ -169,9 +167,8 @@ std::string find_player_path(const unsigned char start, const unsigned char end,
       std::string path = "";
       unsigned char at = end;
       while (!(at == start)) {
-        auto &p = parent_map[at];
-        path += p.second;
-        at = p.first;
+        path += parent_move[at];
+        at = parent_pos[at];
       }
       std::reverse(path.begin(), path.end());
       return path;
@@ -182,8 +179,8 @@ std::string find_player_path(const unsigned char start, const unsigned char end,
       if (is_walkable(next, boxes) && !visited.test(next)) {
         visited.set(next);
         q.push(next);
-        parent_map[next] = {curr,
-                            MOVE_CHARS_BACKWARD[i]};
+        parent_pos[next] = curr;
+        parent_move[next] = MOVE_CHARS_BACKWARD[i];
       }
     }
   }
@@ -250,7 +247,7 @@ void init_distances() {
             (static_map_backward[next] == ' ' || static_map_backward[next] == '.')) {
           visited.set(next);
           q.push(next);
-          distances[{goal, next}] = distances[{goal, curr}] + 1;
+          distances[goal][next] = distances[goal][curr] + 1;
         }
       }
     }
