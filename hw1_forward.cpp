@@ -2,68 +2,44 @@
 #include "tbb/concurrent_unordered_map.h"
 #include "tbb/concurrent_unordered_set.h"
 #include <algorithm>
+#include <bitset>
 #include <boost/functional/hash.hpp>
 #include <condition_variable>
 #include <fstream>
 #include <iostream>
-#include <map>
 #include <mutex>
 #include <omp.h>
 #include <optional>
 #include <queue>
-#include <set>
 #include <string>
 #include <unordered_set>
 #include <utility>
-#include <vector>
 
 // #define DEBUG 1
 #define AXIS_VERTICAL 0
 #define AXIS_HORIZONTAL 1
+#define MAX_MAP_SIZE 256
+#define DIRS(pos, dir_code)                                                    \
+  ((dir_code) == 0   ? ((pos) < width ? -1 : (pos)-width)                      \
+   : (dir_code) == 1 ? ((pos) % width == 0 ? -1 : (pos)-1)                     \
+   : (dir_code) == 2 ? ((pos) >= width * (height - 1) ? -1 : (pos) + width)    \
+   : (dir_code) == 3 ? ((pos) % width == width - 1 ? -1 : (pos) + 1)           \
+                     : -1)
 
-// --- 座標結構 ---
-struct Point {
-  int r, c;
-
-  // 為了能放入 std::set 和 std::map
-  bool operator<(const Point &other) const {
-    if (r != other.r)
-      return r < other.r;
-    return c < other.c;
-  }
-  bool operator==(const Point &other) const {
-    return r == other.r && c == other.c;
-  }
-  Point operator+(const Point &other) const {
-    return {.r = r + other.r, .c = c + other.c};
-  }
-};
-
-// 為 Point 提供 hasher
-struct PointHasher {
-  std::size_t operator()(const Point &p) const {
+struct UnsignedCharPairHasher {
+  std::size_t
+  operator()(const std::pair<unsigned char, unsigned char> &pp) const {
     std::size_t seed = 0;
-    boost::hash_combine(seed, p.r);
-    boost::hash_combine(seed, p.c);
-    return seed;
-  }
-};
-
-struct PointPairHasher {
-  std::size_t operator()(const std::pair<Point, Point> &pp) const {
-    std::size_t seed = 0;
-    boost::hash_combine(seed, pp.first.r);
-    boost::hash_combine(seed, pp.first.c);
-    boost::hash_combine(seed, pp.second.r);
-    boost::hash_combine(seed, pp.second.c);
+    boost::hash_combine(seed, pp.first);
+    boost::hash_combine(seed, pp.second);
     return seed;
   }
 };
 
 // --- 遊戲狀態結構 ---
 struct State {
-  Point playerPos;
-  std::vector<Point> boxPositions; // 保持排序以作為唯一標識
+  unsigned char playerPos;
+  std::bitset<MAX_MAP_SIZE> boxPositions; // 保持排序以作為唯一標識
 
   // 為了能放入 std::set 和 std::map
   bool operator<(const State &other) const {
@@ -71,7 +47,13 @@ struct State {
       return true;
     if (other.playerPos < playerPos)
       return false;
-    return boxPositions < other.boxPositions;
+    // 逐位比較 bitset，避免 to_ulong() overflow
+    for (int i = 0; i < MAX_MAP_SIZE; ++i) {
+      if (boxPositions[i] != other.boxPositions[i]) {
+        return !boxPositions[i] && other.boxPositions[i];
+      }
+    }
+    return false; // 完全相等
   }
   bool operator==(const State &other) const {
     return playerPos == other.playerPos && boxPositions == other.boxPositions;
@@ -82,14 +64,12 @@ struct State {
 struct StateHasher {
   std::size_t operator()(const State &s) const {
     std::size_t seed = 0;
-    boost::hash_combine(seed, s.playerPos.r);
-    boost::hash_combine(seed, s.playerPos.c);
-
-    // 手動計算 vector<Point> 的雜湊值
-    PointHasher point_hasher;
-    for (const auto &box : s.boxPositions) {
-      boost::hash_combine(seed, point_hasher(box));
+    char boxPositions[MAX_MAP_SIZE];
+    for (int i = 0; i < MAX_MAP_SIZE; ++i) {
+      boxPositions[i] = s.boxPositions[i];
     }
+    boost::hash_combine(seed, s.playerPos);
+    boost::hash_combine(seed, boxPositions);
     return seed;
   }
 };
@@ -99,11 +79,8 @@ struct Node {
   State state;
   int f_cost;
 
-  // priority_queue 預設是 max-heap，我們需要 min-heap，所以反轉比較符
-  bool operator>(const Node &other) const { return f_cost > other.f_cost; }
-
   // TBB concurrent_priority_queue 需要 < 運算符
-  bool operator<(const Node &other) const { return f_cost < other.f_cost; }
+  bool operator<(const Node &other) const { return f_cost > other.f_cost; }
 };
 
 // For outside BFS
@@ -111,195 +88,86 @@ struct StateInfo {
   int g_cost;
   State parent_state;
   std::string move_to_get_here;
-  std::unordered_set<Point, PointHasher> frozen_boxes;
+  std::bitset<MAX_MAP_SIZE> frozen_boxes;
 };
 
 // --- 全域變數和輔助函數 ---
-std::vector<std::string> static_map;
-std::set<Point> goals;
-std::unordered_map<std::pair<Point, Point>, int, PointPairHasher> distances;
+// std::vector<std::string> static_map;
+std::string static_map;
+std::bitset<MAX_MAP_SIZE> goals_bitset;
+std::unordered_set<unsigned char> goals_set;
+int distances[MAX_MAP_SIZE][MAX_MAP_SIZE] = {{0}};
 tbb::concurrent_unordered_map<State, StateInfo, StateHasher> state_info_map;
-std::unordered_set<Point, PointHasher> deadlock_points;
+std::bitset<MAX_MAP_SIZE> deadlock_points;
 
 // 方向向量 (Up, Left, Down, Right)
-const std::vector<Point> DIRS = {{-1, 0}, {0, -1}, {1, 0}, {0, 1}};
+unsigned char width, height, map_size;
 const std::string MOVE_CHARS = "WASD"; // 注意順序對應 DIRS
 
-// 匈牙利演算法實作 - 用於最小權重二分匹配
-class HungarianAlgorithm {
-private:
-  std::vector<std::vector<int>> cost_matrix;
-  std::vector<int> u, v, p, way;
-  int n;
-
-public:
-  // 建構函式，接受成本矩陣
-  HungarianAlgorithm(const std::vector<std::vector<int>>& costs) : cost_matrix(costs) {
-    n = costs.size();
-    u.assign(n + 1, 0);
-    v.assign(n + 1, 0);
-    p.assign(n + 1, 0);
-    way.assign(n + 1, 0);
-  }
-
-  // 執行匈牙利演算法，返回最小總成本
-  int solve() {
-    for (int i = 1; i <= n; ++i) {
-      p[0] = i;
-      int j0 = 0;
-      std::vector<int> minv(n + 1, INT_MAX);
-      std::vector<bool> used(n + 1, false);
-      
-      do {
-        used[j0] = true;
-        int i0 = p[j0], delta = INT_MAX, j1;
-        
-        for (int j = 1; j <= n; ++j) {
-          if (!used[j]) {
-            int cur = cost_matrix[i0 - 1][j - 1] - u[i0] - v[j];
-            if (cur < minv[j]) {
-              minv[j] = cur;
-              way[j] = j0;
-            }
-            if (minv[j] < delta) {
-              delta = minv[j];
-              j1 = j;
-            }
-          }
-        }
-        
-        for (int j = 0; j <= n; ++j) {
-          if (used[j]) {
-            u[p[j]] += delta;
-            v[j] -= delta;
-          } else {
-            minv[j] -= delta;
-          }
-        }
-        
-        j0 = j1;
-      } while (p[j0] != 0);
-      
-      do {
-        int j1 = way[j0];
-        p[j0] = p[j1];
-        j0 = j1;
-      } while (j0);
-    }
-    
-    int result = 0;
-    for (int j = 1; j <= n; ++j) {
-      if (p[j] != 0) {
-        result += cost_matrix[p[j] - 1][j - 1];
-      }
-    }
-    return result;
-  }
-};
-
-// 計算狀態 s 的 h_cost - 使用最小權重二分匹配
 int calculate_h_cost(const State &s) {
-  int num_boxes = s.boxPositions.size();
-  int num_goals = goals.size();
-  
-  // 如果箱子數量和目標數量不同，使用舊方法作為備案
-  if (num_boxes != num_goals) {
-    int total_distance = 0;
-    for (const auto &box : s.boxPositions) {
-      int min_dist_for_this_box = 1e9;
-      for (const auto &goal : goals) {
-        int dist = distances[{goal, box}];
-        if (dist < min_dist_for_this_box) {
-          min_dist_for_this_box = dist;
-        }
-      }
-      total_distance += min_dist_for_this_box;
-    }
-    return total_distance;
-  }
-  
-  // 建立成本矩陣：cost_matrix[i][j] = 將第i個箱子推到第j個目標的成本
-  std::vector<std::vector<int>> cost_matrix(num_boxes, std::vector<int>(num_goals));
-  
-  // 將 goals (set) 轉換為 vector 以便索引
-  std::vector<Point> goal_list(goals.begin(), goals.end());
-  
-  for (int i = 0; i < num_boxes; ++i) {
-    for (int j = 0; j < num_goals; ++j) {
-      auto it = distances.find({goal_list[j], s.boxPositions[i]});
-      if (it != distances.end()) {
-        cost_matrix[i][j] = it->second;
-      } else {
-        // 如果找不到預計算的距離，使用曼哈頓距離作為備案
-        cost_matrix[i][j] = abs(s.boxPositions[i].r - goal_list[j].r) + 
-                           abs(s.boxPositions[i].c - goal_list[j].c);
+  int total_distance = 0;
+  for (unsigned char box = 0; box < map_size; ++box) {
+    if (!s.boxPositions.test(box))
+      continue;
+    int min_dist_for_this_box = 1e9;
+    for (unsigned char goal : goals_set) {
+      int dist = distances[goal][box];
+      if (dist < min_dist_for_this_box) {
+        min_dist_for_this_box = dist;
       }
     }
+    total_distance += min_dist_for_this_box;
   }
-  
-  // 使用匈牙利演算法求解最小權重匹配
-  HungarianAlgorithm hungarian(cost_matrix);
-  return hungarian.solve();
+  return total_distance;
 }
 
 // 檢查某座標是否可走 (對玩家而言)
-bool is_walkable(const Point &p, const std::vector<Point> &boxes) {
-  if (p.r < 0 || p.r >= static_cast<int>(static_map.size()) || p.c < 0 ||
-      p.c >= static_cast<int>(static_map[0].size())) {
-    return false;
-  }
-  char tile = static_map[p.r][p.c];
+bool is_walkable(const unsigned char p,
+                 const std::bitset<MAX_MAP_SIZE> &boxes) {
+  char tile = static_map[p];
   if (tile == '#') {
     return false;
   }
   // 檢查是否撞到箱子
-  for (const auto &box : boxes) {
-    if (p == box) {
-      return false;
-    }
-  }
-  return true;
+  return !boxes.test(p);
 }
 
 bool IsBlockedOnAxis(
-    const Point &box,
-    const std::unordered_set<Point, PointHasher> &candidateBoxes,
-    std::unordered_set<Point, PointHasher>
+    const unsigned char box, const std::bitset<MAX_MAP_SIZE> &candidateBoxes,
+    std::bitset<MAX_MAP_SIZE>
         &checkedBoxes, // boxes already checked in recursive steps
-    std::unordered_map<Point, bool, PointHasher> &stuck_status_horizontal,
-    std::unordered_map<Point, bool, PointHasher> &stuck_status_vertical,
-    int axis) {
-  Point pos1 = box + DIRS[axis], pos2 = box + DIRS[axis + 2];
-  checkedBoxes.insert(box);
+    std::unordered_map<unsigned char, bool> &stuck_status_horizontal,
+    std::unordered_map<unsigned char, bool> &stuck_status_vertical, int axis) {
+  unsigned char pos1 = DIRS(box, axis);
+  unsigned char pos2 = DIRS(box, axis + 2);
+  checkedBoxes.set(box);
 
   // Check stuck by wall
-  if (static_map[pos1.r][pos1.c] == '#' || static_map[pos2.r][pos2.c] == '#') {
-    checkedBoxes.erase(box);
+  if (static_map[pos1] == '#' || static_map[pos2] == '#') {
+    checkedBoxes.reset(box);
     return true;
   }
 
   // Check stuck by deadlock point
-  if (deadlock_points.find(pos1) != deadlock_points.end() &&
-      deadlock_points.find(pos2) != deadlock_points.end()) {
-    checkedBoxes.erase(box);
+  if (deadlock_points.test(pos1) && deadlock_points.test(pos2)) {
+    checkedBoxes.reset(box);
     return true;
   }
 
   // Check stuck by other boxes
 
   // cycle check
-  if (checkedBoxes.find(pos1) != checkedBoxes.end() ||
-      checkedBoxes.find(pos2) != checkedBoxes.end()) {
-    checkedBoxes.erase(box);
+  if (checkedBoxes.test(pos1) || checkedBoxes.test(pos2)) {
+    checkedBoxes.reset(box);
     return true;
   }
 
   bool pos_stucks[2] = {false, false};
-  Point poses[2] = {pos1, pos2};
+  unsigned char poses[2] = {pos1, pos2};
 
-  for (int i = 0; i < 2; ++i) {
-    Point pos = poses[i];
-    if (candidateBoxes.find(pos) != candidateBoxes.end()) {
+  for (unsigned char i = 0; i < 2; ++i) {
+    unsigned char pos = poses[i];
+    if (candidateBoxes.test(pos)) {
       if (axis == AXIS_VERTICAL) {
         if (stuck_status_horizontal.find(pos) !=
             stuck_status_horizontal.end()) {
@@ -322,115 +190,129 @@ bool IsBlockedOnAxis(
         }
       }
       if (pos_stucks[i]) {
-        checkedBoxes.erase(box);
+        checkedBoxes.reset(box);
         return true;
       }
     }
   }
-  checkedBoxes.erase(box);
+  checkedBoxes.reset(box);
   return false;
 }
 
-bool is_dead_goal(const std::unordered_set<Point, PointHasher> &candidateBoxes,
-                  const std::unordered_set<Point, PointHasher> &frozenBoxes) {
+bool is_dead_goal(const std::bitset<MAX_MAP_SIZE> &candidateBoxes,
+                  const std::bitset<MAX_MAP_SIZE> &frozenBoxes) {
   // check every unmatched goals if it is a dead goal
-  for (const auto &goal : goals) { 
-    // regard the frozen boxes as walls, do BFS to check if any candidate box is reachable from the goal
-    if (frozenBoxes.find(goal) != frozenBoxes.end()) continue;
+  for (unsigned char goal : goals_set) {
+    // regard the frozen boxes as walls, do BFS to check if any candidate box is
+    // reachable from the goal
+    if (frozenBoxes.test(goal))
+      continue;
     bool is_dead = true;
-    std::queue<Point> q;
+    std::queue<unsigned char> q;
     q.push(goal);
-    std::set<Point> visited;
-    visited.insert(goal);
+    std::bitset<MAX_MAP_SIZE> visited;
+    visited.set(goal);
     while (!q.empty()) {
-      Point curr = q.front();
+      unsigned char curr = q.front();
       q.pop();
-      if (candidateBoxes.find(curr) != candidateBoxes.end() && frozenBoxes.find(curr) == frozenBoxes.end()) {
+      if (candidateBoxes.test(curr) && !frozenBoxes.test(curr)) {
         is_dead = false;
         break;
       }
       for (int i = 0; i < 4; ++i) {
-        Point next = curr + DIRS[i], next2 = next + DIRS[i];
-        if (visited.find(next) == visited.end() && 
-        static_map[next.r][next.c] != '#' && frozenBoxes.find(next) == frozenBoxes.end() && 
-        static_map[next2.r][next2.c] != '#' && frozenBoxes.find(next2) == frozenBoxes.end()) {
-          visited.insert(next);
+        unsigned char next = DIRS(curr, i);
+        int try_next2 = DIRS(next, i);
+        if (try_next2 == -1)
+          continue;
+        unsigned char next2 = try_next2;
+        if (!visited.test(next) && static_map[next] != '#' &&
+            !frozenBoxes.test(next) && static_map[next2] != '#' &&
+            !frozenBoxes.test(next2)) {
+          visited.set(next);
           q.push(next);
         }
       }
     }
-    if (is_dead) return true;
+    if (is_dead)
+      return true;
   }
   return false;
 }
 
-bool is_dead_box(const std::unordered_set<Point, PointHasher> &candidateBoxes, const std::unordered_set<Point, PointHasher> &frozenBoxes) {
-  for (const auto &box : candidateBoxes) {
-    if (frozenBoxes.find(box) != frozenBoxes.end()) continue;
-    // regard the frozen boxes as walls, do BFS to check if any goal is reachable from the box
+bool is_dead_box(const std::bitset<MAX_MAP_SIZE> &candidateBoxes,
+                 const std::bitset<MAX_MAP_SIZE> &frozenBoxes) {
+  std::bitset<MAX_MAP_SIZE> unFrozenBoxes = candidateBoxes & ~frozenBoxes;
+  for (unsigned char box = 0; box < map_size; ++box) {
+    if (!unFrozenBoxes.test(box))
+      continue;
+    // regard the frozen boxes as walls, do BFS to check if any goal is
+    // reachable from the box
     bool is_dead = true;
-    std::queue<Point> q;
+    std::queue<unsigned char> q;
     q.push(box);
-    std::set<Point> visited;
-    visited.insert(box);
+    std::bitset<MAX_MAP_SIZE> visited;
+    visited.set(box);
     while (!q.empty()) {
-      Point curr = q.front();
+      unsigned char curr = q.front();
       q.pop();
-      if (goals.find(curr) != goals.end()) {
+      if (goals_bitset.test(curr)) {
         is_dead = false;
         break;
       }
       for (int i = 0; i < 4; ++i) {
-        Point next = curr + DIRS[i], prev = curr + DIRS[(i + 2) % 4];
-        if (visited.find(next) == visited.end() &&
-            static_map[next.r][next.c] != '#' && frozenBoxes.find(next) == frozenBoxes.end() &&
-            static_map[prev.r][prev.c] != '#' && frozenBoxes.find(prev) == frozenBoxes.end()) {
-          visited.insert(next);
+        unsigned char next = DIRS(curr, i);
+        unsigned char prev = DIRS(curr, (i + 2) % 4);
+        if (!visited.test(next) && static_map[next] != '#' &&
+            !frozenBoxes.test(next) && static_map[prev] != '#' &&
+            !frozenBoxes.test(prev)) {
+          visited.set(next);
           q.push(next);
         }
       }
     }
-    if (is_dead) return true;
+    if (is_dead)
+      return true;
   }
   return false;
 }
 
-bool is_deadlock(const State &newState, const Point &movedBox, std::unordered_set<Point, PointHasher> &frozenBoxes) {
-  std::unordered_set<Point, PointHasher> candidateBoxes;
-  std::unordered_set<Point, PointHasher> all_boxes(newState.boxPositions.begin(), newState.boxPositions.end());
-
+bool is_deadlock(const State &newState, const unsigned char movedBox,
+                 std::bitset<MAX_MAP_SIZE> &frozenBoxes) {
+  std::bitset<MAX_MAP_SIZE> candidateBoxes;
+  std::bitset<MAX_MAP_SIZE> all_boxes(newState.boxPositions);
   // BFS from movedBox to find connected boxes
-  std::queue<Point> q;
+  std::queue<unsigned char> q;
   q.push(movedBox);
-  std::unordered_set<Point, PointHasher> visited;
-  visited.insert(movedBox);
+  std::bitset<MAX_MAP_SIZE> visited;
+  visited.set(movedBox);
   while (!q.empty()) {
-    Point curr = q.front();
+    unsigned char curr = q.front();
     q.pop();
-    candidateBoxes.insert(curr);
+    candidateBoxes.set(curr);
     for (int i = 0; i < 4; ++i) {
-      Point next = curr + DIRS[i];
-      if (all_boxes.find(next) != all_boxes.end() &&
-          visited.find(next) == visited.end()) {
-        visited.insert(next);
+      unsigned char next = DIRS(curr, i);
+      if (all_boxes.test(next) && !visited.test(next)) {
+        visited.set(next);
         q.push(next);
       }
     }
   }
 
   // For freeze deadlock
-  std::unordered_map<Point, bool, PointHasher> stuck_status_horizontal;
-  std::unordered_map<Point, bool, PointHasher> stuck_status_vertical;
-  std::unordered_set<Point, PointHasher> checkedBoxes;
+  std::unordered_map<unsigned char, bool> stuck_status_horizontal;
+  std::unordered_map<unsigned char, bool> stuck_status_vertical;
+  std::bitset<MAX_MAP_SIZE> checkedBoxes;
+  std::bitset<MAX_MAP_SIZE> unFrozenBoxes = candidateBoxes & ~frozenBoxes;
 
-  for (const auto &box : candidateBoxes) {
-    if (frozenBoxes.find(box) != frozenBoxes.end()) continue;
+  for (unsigned char box = 0; box < map_size; ++box) {
+    if (!unFrozenBoxes.test(box))
+      continue;
     bool horizontally_stuck = false, vertically_stuck = false;
     // Check if the box is horizontally stuck
     if (stuck_status_horizontal.find(box) != stuck_status_horizontal.end()) {
       horizontally_stuck = stuck_status_horizontal[box];
     } else {
-      checkedBoxes.clear();
+      checkedBoxes.reset();
       horizontally_stuck = IsBlockedOnAxis(
           box, candidateBoxes, checkedBoxes, stuck_status_horizontal,
           stuck_status_vertical, AXIS_HORIZONTAL);
@@ -441,7 +323,7 @@ bool is_deadlock(const State &newState, const Point &movedBox, std::unordered_se
     if (stuck_status_vertical.find(box) != stuck_status_vertical.end()) {
       vertically_stuck = stuck_status_vertical[box];
     } else {
-      checkedBoxes.clear();
+      checkedBoxes.reset();
       vertically_stuck = IsBlockedOnAxis(box, candidateBoxes, checkedBoxes,
                                          stuck_status_horizontal,
                                          stuck_status_vertical, AXIS_VERTICAL);
@@ -449,20 +331,17 @@ bool is_deadlock(const State &newState, const Point &movedBox, std::unordered_se
     }
 
     if (horizontally_stuck && vertically_stuck) {
-      frozenBoxes.insert(box);
+      frozenBoxes.set(box);
     }
   }
 
   // If there is any frozen box not in goal, it is a freeze deadlock
-  if (frozenBoxes.empty())
+  if (frozenBoxes.none())
     return false;
-  for (const auto &box : frozenBoxes) {
-    if (goals.find(box) == goals.end()) {
-      return true;
-    }
-  }
+  if ((frozenBoxes & ~goals_bitset).any())
+    return true;
   // If there is any dead goal, it is a deadlock
-  if (is_dead_goal(all_boxes, frozenBoxes))  {
+  if (is_dead_goal(all_boxes, frozenBoxes)) {
     return true;
   }
   if (is_dead_box(all_boxes, frozenBoxes)) {
@@ -472,59 +351,102 @@ bool is_deadlock(const State &newState, const Point &movedBox, std::unordered_se
 }
 
 // 內層 BFS: 尋找玩家從 start 到 end 的路徑
-std::string find_player_path(const Point &start, const Point &end,
-                             const std::vector<Point> &boxes) {
-  std::queue<Point> q;
+std::string find_player_path(const unsigned char start, const unsigned char end,
+                             const std::bitset<MAX_MAP_SIZE> &boxes) {
+  std::queue<unsigned char> q;
   q.push(start);
-  std::map<Point, std::pair<Point, char>> parent_map;
-  std::set<Point> visited;
-  visited.insert(start);
+  unsigned char parent_pos[MAX_MAP_SIZE];
+  char parent_move[MAX_MAP_SIZE];
+  std::bitset<MAX_MAP_SIZE> visited;
+  visited.set(start);
 
   while (!q.empty()) {
-    Point curr = q.front();
+    unsigned char curr = q.front();
     q.pop();
 
     if (curr == end) {
       std::string path = "";
-      Point at = end;
+      unsigned char at = end;
       while (!(at == start)) {
-        auto &p = parent_map[at];
-        path += p.second;
-        at = p.first;
+        path += parent_move[at];
+        at = parent_pos[at];
       }
       std::reverse(path.begin(), path.end());
       return path;
     }
 
     for (int i = 0; i < 4; ++i) {
-      Point next = curr + DIRS[i];
-      if (is_walkable(next, boxes) && visited.find(next) == visited.end()) {
-        visited.insert(next);
+      unsigned char next = DIRS(curr, i);
+      if (is_walkable(next, boxes) && !visited.test(next)) {
+        visited.set(next);
         q.push(next);
-        parent_map[next] = {curr, MOVE_CHARS[i]};
+        parent_pos[next] = curr;
+        parent_move[next] = MOVE_CHARS[i];
       }
     }
   }
   return "none"; // 找不到路徑
 }
 
+std::string normalize_player_position(State &state) {
+  // 使用 BFS 找到玩家能到達的所有位置
+  std::queue<unsigned char> q;
+  std::bitset<MAX_MAP_SIZE> visited;
+  unsigned char start = state.playerPos;
+
+  q.push(start);
+  visited.set(start);
+
+  unsigned char topLeft = start; // 初始化為起始位置
+
+  while (!q.empty()) {
+    unsigned char curr = q.front();
+    q.pop();
+
+    // 檢查是否是更 top-left 的位置
+    if (curr < topLeft) {
+      topLeft = curr;
+    }
+
+    // 探索四個方向
+    for (int i = 0; i < 4; ++i) {
+      unsigned char next = DIRS(curr, i);
+      if (is_walkable(next, state.boxPositions) && !visited.test(next)) {
+        visited.set(next);
+        q.push(next);
+      }
+    }
+  }
+  state.playerPos = topLeft;
+
+  // 如果最 top-left 的位置就是當前位置，回傳空字串
+  if (topLeft == start) {
+    return "";
+  }
+
+  // 使用現有的 find_player_path 函式找到路徑
+  return find_player_path(start, topLeft, state.boxPositions);
+}
+
 void init_distances() {
-  for (const auto &goal : goals) {
-    std::queue<Point> q;
+  for (unsigned char goal : goals_set) {
+    std::queue<unsigned char> q;
     q.push(goal);
-    std::set<Point> visited;
-    visited.insert(goal);
+    std::bitset<MAX_MAP_SIZE> visited;
+    visited.set(goal);
     while (!q.empty()) {
-      Point curr = q.front();
+      unsigned char curr = q.front();
       q.pop();
       for (int i = 0; i < 4; ++i) {
-        Point next = curr + DIRS[i];
-        if (visited.find(next) == visited.end() &&
-            (static_map[next.r][next.c] == ' ' ||
-             static_map[next.r][next.c] == '.')) {
-          visited.insert(next);
+        int try_next = DIRS(curr, i);
+        if (try_next == -1)
+          continue;
+        unsigned char next = try_next;
+        if (!visited.test(next) &&
+            (static_map[next] == ' ' || static_map[next] == '.')) {
+          visited.set(next);
           q.push(next);
-          distances[{goal, next}] = distances[{goal, curr}] + 1;
+          distances[goal][next] = distances[goal][curr] + 1;
         }
       }
     }
@@ -532,42 +454,40 @@ void init_distances() {
 }
 
 void init_deadlock_points() {
-  std::unordered_set<Point, PointHasher> safe;
-  for (const Point &goal : goals) {
-    std::queue<Point> q;
+  std::bitset<MAX_MAP_SIZE> safe;
+  for (unsigned char goal : goals_set) {
+    std::queue<unsigned char> q;
     q.push(goal);
-    std::set<Point> visited;
-    visited.insert(goal);
+    std::bitset<MAX_MAP_SIZE> visited;
+    visited.set(goal);
     while (!q.empty()) {
-      Point curr = q.front();
+      unsigned char curr = q.front();
       q.pop();
-      safe.insert(curr);
+      safe.set(curr);
       for (int i = 0; i < 4; ++i) {
-        Point next = curr + DIRS[i], next2 = next + DIRS[i];
-        if (next.r < 0 || next.r >= static_cast<int>(static_map.size()) ||
-            next.c < 0 || next.c >= static_cast<int>(static_map[0].size()))
+        int try_next = DIRS(curr, i);
+        if (try_next == -1)
           continue;
-        if (next2.r < 0 || next2.r >= static_cast<int>(static_map.size()) ||
-            next2.c < 0 || next2.c >= static_cast<int>(static_map[0].size()))
+        unsigned char next = try_next;
+        int try_next2 = DIRS(next, i);
+        if (try_next2 == -1)
           continue;
-        if (visited.find(next) != visited.end())
+        unsigned char next2 = try_next2;
+
+        if (visited.test(next))
           continue;
-        if ((static_map[next.r][next.c] == ' ' ||
-             static_map[next.r][next.c] == '.') &&
-            (static_map[next2.r][next2.c] == ' ' ||
-             static_map[next2.r][next2.c] == '.' ||
-             static_map[next2.r][next2.c] == '@')) {
-          visited.insert(next);
+        if ((static_map[next] == ' ' || static_map[next] == '.') &&
+            (static_map[next2] == ' ' || static_map[next2] == '.' ||
+             static_map[next2] == '@')) {
+          visited.set(next);
           q.push(next);
         }
       }
     }
   }
-  for (int r = 0; r < static_cast<int>(static_map.size()); ++r) {
-    for (int c = 0; c < static_cast<int>(static_map[0].size()); ++c) {
-      if (safe.find({r, c}) == safe.end() && static_map[r][c] == ' ') {
-        deadlock_points.insert({r, c});
-      }
+  for (unsigned char i = 0; i < map_size; ++i) {
+    if (!safe.test(i) && static_map[i] == ' ') {
+      deadlock_points.set(i);
     }
   }
   return;
@@ -588,72 +508,86 @@ int main(int argc, char *argv[]) {
 
   State initial_state;
   std::string line;
-  int r = 0;
+  unsigned char r = 0;
   while (std::getline(file, line)) {
-    static_map.push_back(line);
-    for (int c = 0; c < static_cast<int>(line.length()); ++c) {
+    width = line.length();
+    static_map += line;
+    for (unsigned char c = 0; c < static_cast<int>(line.length()); ++c) {
       char tile = line[c];
       if (tile == 'o' || tile == 'O' || tile == '!') {
-        initial_state.playerPos = {r, c};
+        initial_state.playerPos = r * width + c;
       }
       if (tile == 'x' || tile == 'X') {
-        initial_state.boxPositions.push_back({r, c});
+        initial_state.boxPositions.set(r * width + c);
       }
       if (tile == '.' || tile == 'O' || tile == 'X') {
-        goals.insert({r, c});
+        goals_bitset.set(r * width + c);
+        goals_set.insert(r * width + c);
       }
       // 將地圖簡化為靜態部分
       if (tile == 'o' || tile == 'x' || tile == ' ')
-        static_map[r][c] = ' ';
+        static_map[r * width + c] = ' ';
       else if (tile == 'O' || tile == 'X' || tile == '.')
-        static_map[r][c] = '.';
+        static_map[r * width + c] = '.';
       else if (tile == '!')
-        static_map[r][c] = '@';
+        static_map[r * width + c] = '@';
     }
     r++;
   }
+  height = r;
+  map_size = width * height;
+#ifdef DEBUG
+  std::cout << "width: " << static_cast<int>(width)
+            << ", height: " << static_cast<int>(height)
+            << ", map_size: " << static_cast<int>(map_size) << std::endl;
+#endif
   file.close();
 
   // 初始化距離
   init_distances();
   init_deadlock_points();
 
-  // 排序初始箱子位置
-  std::sort(initial_state.boxPositions.begin(),
-            initial_state.boxPositions.end());
-
 #ifdef DEBUG
   // 輸出初始狀態資訊
   std::cout << "初始狀態資訊:" << std::endl;
-  std::cout << "玩家位置: (" << initial_state.playerPos.r << ", "
-            << initial_state.playerPos.c << ")" << std::endl;
+  std::cout << "玩家位置: (" << initial_state.playerPos % width << ", "
+            << initial_state.playerPos / width << ")" << std::endl;
   std::cout << "箱子數量: " << initial_state.boxPositions.size() << std::endl;
   std::cout << "箱子位置: ";
-  for (const auto &box : initial_state.boxPositions) {
-    std::cout << "(" << box.r << ", " << box.c << ") ";
+  for (unsigned char box = 0; box < map_size; ++box) {
+    if (initial_state.boxPositions.test(box)) {
+      std::cout << "(" << box % width << ", " << box / width << ") ";
+    }
   }
   std::cout << std::endl;
-  std::cout << "目標數量: " << goals.size() << std::endl;
+  std::cout << "目標數量: " << goals_bitset.size() << std::endl;
   std::cout << "目標位置: ";
-  for (const auto &goal : goals) {
-    std::cout << "(" << goal.r << ", " << goal.c << ") ";
+  for (unsigned char goal = 0; goal < map_size; ++goal) {
+    if (goals_bitset.test(goal)) {
+      std::cout << "(" << goal % width << ", " << goal / width << ") ";
+    }
   }
   std::cout << std::endl;
 
   // 印出 static_map
   std::cout << "static_map:" << std::endl;
-  for (const auto &row : static_map) {
-    std::cout << row << std::endl;
+  for (unsigned char pos = 0; pos < map_size; ++pos) {
+    std::cout << static_map[pos];
+    if (pos % width == width - 1) {
+      std::cout << std::endl;
+    }
   }
   std::cout << "distances:" << std::endl;
   for (const auto &[key, value] : distances) {
-    std::cout << "(" << key.first.r << ", " << key.first.c << ") -> ("
-              << key.second.r << ", " << key.second.c << "): " << value
-              << std::endl;
+    std::cout << "(" << key.first % width << ", " << key.first / width
+              << ") -> (" << key.second % width << ", " << key.second / width
+              << "): " << value << std::endl;
   }
   std::cout << "deadlock_points:" << std::endl;
-  for (const auto &point : deadlock_points) {
-    std::cout << "(" << point.r << ", " << point.c << ") ";
+  for (unsigned char point = 0; point < map_size; ++point) {
+    if (deadlock_points.test(point)) {
+      std::cout << "(" << point % width << ", " << point / width << ") ";
+    }
   }
   std::cout << std::endl;
 #endif
@@ -665,9 +599,10 @@ int main(int argc, char *argv[]) {
   int initial_h = calculate_h_cost(initial_state);
   tbb::concurrent_priority_queue<Node> pq;
   pq.push({initial_state, initial_g + initial_h});
-  state_info_map.insert({initial_state,
-                         {initial_g, initial_state, "",
-                          std::unordered_set<Point, PointHasher>()}});
+  std::bitset<MAX_MAP_SIZE> initial_frozen_boxes(0);
+  initial_frozen_boxes.reset();
+  state_info_map.insert(
+      {initial_state, {initial_g, initial_state, "", initial_frozen_boxes}});
 
   // 平行處理所需變數
   std::atomic<bool> solution_found = false;
@@ -722,18 +657,20 @@ int main(int argc, char *argv[]) {
 
       // 有工作要做
       State current_state = current_node.state;
-      std::cout << std::flush;
 
 #ifdef DEBUG
       int current_step = step_count.fetch_add(1) + 1;
       {
         std::lock_guard<std::mutex> lock(debug_mutex);
         std::cout << "[Thread " << thread_id << "] 步驟 " << current_step
-                  << ": 檢查狀態 - 玩家位置: (" << current_state.playerPos.r
-                  << ", " << current_state.playerPos.c << ")" << std::endl;
+                  << ": 檢查狀態 - 玩家位置: ("
+                  << current_state.playerPos / width << ", "
+                  << current_state.playerPos % width << ")" << std::endl;
         std::cout << "[Thread " << thread_id << "] 箱子位置: ";
-        for (const auto &box : current_state.boxPositions) {
-          std::cout << "(" << box.r << ", " << box.c << ") ";
+        for (unsigned char box = 0; box < map_size; ++box) {
+          if (current_state.boxPositions.test(box)) {
+            std::cout << "(" << box / width << ", " << box % width << ") ";
+          }
         }
         std::cout << std::endl;
       }
@@ -741,11 +678,8 @@ int main(int argc, char *argv[]) {
 
       // 檢查是否達成目標
       bool solved = true;
-      for (const auto &box : current_state.boxPositions) {
-        if (goals.find(box) == goals.end()) {
-          solved = false;
-          break;
-        }
+      if ((goals_bitset & ~current_state.boxPositions).any()) {
+        solved = false;
       }
 
       // 找到解答，atomic 設置解答狀態
@@ -782,18 +716,19 @@ int main(int argc, char *argv[]) {
 #endif
 
       // 產生所有可能的後繼狀態 (嘗試推動每一個箱子)
-      for (int i = 0; i < static_cast<int>(current_state.boxPositions.size());
-           ++i) {
+      for (unsigned char i = 0; i < map_size; ++i) {
         if (solution_found)
           break;
-        const auto &box = current_state.boxPositions[i];
+        if (!current_state.boxPositions.test(i))
+          continue;
+        unsigned char box = i;
 
 #ifdef DEBUG
         {
           std::lock_guard<std::mutex> lock(debug_mutex);
-          std::cout << "[Thread " << thread_id << "] 檢查箱子 " << i
-                    << " 在位置 (" << box.r << ", " << box.c << ")"
-                    << std::endl;
+          std::cout << "[Thread " << thread_id << "] 檢查箱子 "
+                    << static_cast<int>(i) << " 在位置 (" << box / width << ", "
+                    << box % width << ")" << std::endl;
         }
 #endif
 
@@ -801,23 +736,23 @@ int main(int argc, char *argv[]) {
         for (int j = 0; j < 4; ++j) {
           if (solution_found)
             break;
-          Point push_dir = DIRS[j];
+          unsigned char box_dest = DIRS(box, j);
           char push_char = MOVE_CHARS[j];
 
-          Point box_dest = box + push_dir;
-          Point player_start_pos =
-              box + DIRS[(j + 2) % 4]; // 玩家要站的位置 (箱子反方向)
+          unsigned char player_start_pos =
+              DIRS(box, (j + 2) % 4); // 玩家要站的位置 (箱子反方向)
 
 #ifdef DEBUG
           {
             std::lock_guard<std::mutex> lock(debug_mutex);
             std::cout << "[Thread " << thread_id << "] 嘗試方向 " << push_char
-                      << " - 箱子目標: (" << box_dest.r << ", " << box_dest.c
-                      << "), 玩家需站在: (" << player_start_pos.r << ", "
-                      << player_start_pos.c << ")" << std::endl;
+                      << " - 箱子目標: (" << box_dest / width << ", "
+                      << box_dest % width << "), 玩家需站在: ("
+                      << player_start_pos / width << ", "
+                      << player_start_pos % width << ")" << std::endl;
           }
 #endif
-          char dest_tile = static_map[box_dest.r][box_dest.c];
+          char dest_tile = static_map[box_dest];
           if (dest_tile == '#' || dest_tile == '@') {
 
 #ifdef DEBUG
@@ -831,7 +766,7 @@ int main(int argc, char *argv[]) {
             continue; // 箱子不能上牆或脆弱地板
           }
 
-          if (deadlock_points.find(box_dest) != deadlock_points.end()) {
+          if (deadlock_points.test(box_dest)) {
 #ifdef DEBUG
             {
               std::lock_guard<std::mutex> lock(debug_mutex);
@@ -842,14 +777,7 @@ int main(int argc, char *argv[]) {
             continue;
           }
 
-          bool occupied = false;
-          for (const auto &other_box : current_state.boxPositions) {
-            if (box_dest == other_box) {
-              occupied = true;
-              break;
-            }
-          }
-          if (occupied) {
+          if (current_state.boxPositions.test(box_dest)) {
 #ifdef DEBUG
             {
               std::lock_guard<std::mutex> lock(debug_mutex);
@@ -889,12 +817,12 @@ int main(int argc, char *argv[]) {
             State next_state;
             next_state.playerPos = box; // 推完後玩家在箱子原來的位置
             next_state.boxPositions = current_state.boxPositions;
-            next_state.boxPositions[i] = box_dest;
-            std::sort(next_state.boxPositions.begin(),
-                      next_state.boxPositions.end());
+            next_state.boxPositions.reset(box);
+            next_state.boxPositions.set(box_dest);
             // 1. 安全地讀取 current_state 的 g_cost
             auto it_current = state_info_map.find(current_state);
-            std::unordered_set<Point, PointHasher> new_frozen_boxes = it_current->second.frozen_boxes;
+            std::bitset<MAX_MAP_SIZE> new_frozen_boxes =
+                it_current->second.frozen_boxes;
 
             if (is_deadlock(next_state, box_dest, new_frozen_boxes)) {
 #ifdef DEBUG
@@ -912,11 +840,14 @@ int main(int argc, char *argv[]) {
               std::lock_guard<std::mutex> lock(debug_mutex);
               std::cout << "[Thread " << thread_id
                         << "] 產生新狀態 - 玩家位置: ("
-                        << next_state.playerPos.r << ", "
-                        << next_state.playerPos.c << ")" << std::endl;
+                        << next_state.playerPos / width << ", "
+                        << next_state.playerPos % width << ")" << std::endl;
               std::cout << "[Thread " << thread_id << "] 新狀態箱子位置: ";
-              for (const auto &new_box : next_state.boxPositions) {
-                std::cout << "(" << new_box.r << ", " << new_box.c << ") ";
+              for (unsigned char new_box = 0; new_box < map_size; ++new_box) {
+                if (next_state.boxPositions.test(new_box)) {
+                  std::cout << "(" << new_box / width << ", " << new_box % width
+                            << ") ";
+                }
               }
               std::cout << std::endl;
             }
@@ -933,8 +864,10 @@ int main(int argc, char *argv[]) {
 #endif
 
             // 2. 創建新狀態的資訊
+            std::string normalized_move = normalize_player_position(next_state);
             StateInfo new_info = {new_g, current_state,
-                                  player_moves + push_char, new_frozen_boxes};
+                                  player_moves + push_char + normalized_move,
+                                  new_frozen_boxes};
 
 #ifdef DEBUG
             {
